@@ -18,12 +18,12 @@ def test_end_to_end(tmp_path, drivers, workbook):
     with make_client(tmp_path, drivers) as c:
         assert c.get("/").status_code == 200
         r = c.post("/api/import", files={"file": ("CD_Collection.xlsx", workbook.read_bytes())})
-        assert r.json()["added"] == 6
+        assert r.json()["added"] == 7
 
         albums = c.get("/api/albums").json()
         assert [a["artist"] for a in albums] == ["Alice In Chains", "Nine Inch Nails", "Nirvana", "Pink Floyd"]
         assert len(albums) == 4
-        assert len(c.get("/api/albums?media=all").json()) == 5
+        assert len(c.get("/api/albums?media=all").json()) == 6
 
         dirt = next(a for a in albums if a["title"] == "Dirt")
         slot = c.get("/api/slots/free").json()

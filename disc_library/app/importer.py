@@ -84,8 +84,9 @@ def parse_workbook(path: Path | str) -> list[dict]:
             artist, title = _clean(rec.get("artist")), _clean(rec.get("title"))
             if not artist or not title:
                 continue
-            is_video = "video" in ws.title.lower()
-            fmt = _clean(rec.get("format")) or ("DVD/Blu-ray" if is_video else "CD")
+            fmt = _clean(rec.get("format"))
+            is_video = "video" in ws.title.lower() or bool(fmt and re.search(r"video|\bdvd\b", fmt, re.I))
+            fmt = fmt or ("DVD/Blu-ray" if is_video else "CD")
             status_raw = (_clean(rec.get("status")) or "").lower()
             rows.append(
                 {

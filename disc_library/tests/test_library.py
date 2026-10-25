@@ -23,14 +23,15 @@ def disc_id(db, title):
 # --- import -------------------------------------------------------------------
 def test_import_reads_all_tabs(db, workbook):
     result = import_workbook(db, workbook)
-    assert result["added"] == 6
-    assert result["by_sheet"] == {"CD Collection": 4, "Non-CD Formats": 1, "Video (non-CD)": 1}
+    assert result["added"] == 7
+    assert result["by_sheet"] == {"CD Collection": 4, "Non-CD Formats": 2, "Video (non-CD)": 1}
     kid_a = db.one("SELECT * FROM albums WHERE title = 'Kid A'")
     assert kid_a["status"] == "on_order"
     dirt = db.one("SELECT * FROM albums WHERE title = 'Dirt'")
     assert dirt["year"] == 1992 and dirt["catalog_no"] == "CK 52475"
     assert db.one("SELECT format FROM albums WHERE artist = 'Pink Floyd'")["format"] == "SACD"
     assert db.one("SELECT media_kind FROM albums WHERE artist = 'Various'")["media_kind"] == "video"
+    assert db.one("SELECT media_kind FROM albums WHERE artist = 'Example Band'")["media_kind"] == "video"
 
 
 def test_reimport_keeps_locations_and_favorites(db, workbook):
@@ -39,7 +40,7 @@ def test_reimport_keeps_locations_and_favorites(db, workbook):
     lib.set_location(disc_id(db, "Dirt"), "changer", 2, 17)
     lib.set_favorite(album_id(db, "Dirt"), True)
     result = import_workbook(db, workbook)
-    assert result["added"] == 0 and result["updated"] == 6
+    assert result["added"] == 0 and result["updated"] == 7
     dirt = lib.album(album_id(db, "Dirt"))
     assert (dirt["changer_id"], dirt["slot"], dirt["favorite"]) == (2, 17, 1)
 

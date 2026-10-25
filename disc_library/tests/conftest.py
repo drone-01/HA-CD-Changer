@@ -55,6 +55,7 @@ def workbook(tmp_path):
     ws2 = wb.create_sheet("Non-CD Formats")
     ws2.append(["Artist", "Title", "Format", "Catalog No.", "Year", "Label", "Notes", "Status"])
     ws2.append(["Pink Floyd", "The Dark Side of the Moon", "SACD", "", 1973, "Harvest", "", "Owned"])
+    ws2.append(["Example Band", "Live Somewhere", "Blu-ray (concert video)", "", 2015, "", "", "Owned"])
     ws3 = wb.create_sheet("Video (non-CD)")
     ws3.insert_rows(1)
     ws3["A1"] = "Video collection"
