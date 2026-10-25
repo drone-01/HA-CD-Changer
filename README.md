@@ -4,7 +4,7 @@ An album-first app for browsing and playing a physical disc collection across
 two Sony BDP-CX7000ES 400-disc changers. It runs as a Home Assistant add-on
 with its own sidebar panel, designed for the iPhone first.
 
-## What works today (v0.2.0)
+## What works today (v0.3.0)
 
 | Area | Status |
 | --- | --- |
@@ -21,7 +21,8 @@ with its own sidebar panel, designed for the iPhone first.
 | Phone-first web app (Library, Vibe Sesh, Playing, Stats, album sheet) | Done |
 | Simulated changers for testing without hardware | Done |
 | **Real CX7000ES control** | **Shell only, waiting on Sony's protocol sheet (Phase 1)** |
-| Cover art, track lists, runtimes, genres (MusicBrainz + Cover Art Archive), fix-a-match | Done (v0.2.0) |
+| Cover art, track lists, runtimes, genres (MusicBrainz + Cover Art Archive, Apple Music artwork fallback) | Done |
+| Pressing verification: see, edit or enter catalog no. / barcode, search releases, lock; review screen; bulk lock; Excel export | Done (v0.3.0) |
 | HA `media_player` entities (Theatrium, voice, dashboard card) | Phase 2 |
 | Theater dashboard and Listen/Watch scripts | Phase 0, built in HA |
 
@@ -85,8 +86,21 @@ request a second). Covers are saved in the add-on's data folder, so the grid sta
   BMG/Columbia House club editions) pins the exact pressing.
 - Notes in titles ("— Disc 2", "— second copy", "(CD single)") are ignored for matching, and the
   disc number picks the right track list.
-- Anything uncertain is left unmatched rather than guessed. Open the album, tap **Fix match**,
-  and paste the MusicBrainz release link.
+- Anything uncertain is left unmatched rather than guessed.
+- If the Cover Art Archive can't be reached, covers come from Apple Music instead (matched on artist
+  and album). The job stops itself with a message if MusicBrainz can't be reached at all.
+
+## Pressings
+
+Each album's **Pressing** card shows the catalog number on your disc, the barcode, and the exact
+MusicBrainz release it's matched to (label, country, date, format, catalog number, track count).
+
+- **Confirm & lock** pins the album to that release.
+- **Change pressing / Find pressing**: type the catalog number or barcode, search, and lock the right
+  release. Locking always pulls track list, runtime and details from that exact release.
+- Locked albums are never re-matched, and re-importing the spreadsheet doesn't change them.
+- **Library → Verify pressings** lists albums to review, ones matched on catalog number (lock them all
+  at once), unmatched ones, and locked ones, and exports everything to Excel.
 - Genres you set yourself are never overwritten.
 
 ## Notes

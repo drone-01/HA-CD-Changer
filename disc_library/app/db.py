@@ -89,6 +89,20 @@ MIGRATIONS = {
         "enrich_status": "TEXT NOT NULL DEFAULT 'pending'",   # pending | matched | manual | not_found | error | skipped
         "enrich_note": "TEXT",
         "enriched_at": "TEXT",
+        # pressing verification (v0.3.0)
+        "match_method": "TEXT",                 # catalog | barcode | title | manual
+        "catalog_verified": "TEXT",             # catalog number confirmed in the app (spreadsheet value kept as is)
+        "barcode": "TEXT",
+        "pressing_locked": "INTEGER NOT NULL DEFAULT 0",
+        "locked_at": "TEXT",
+        "rel_label": "TEXT",                    # details of the matched MusicBrainz release
+        "rel_catno": "TEXT",
+        "rel_barcode": "TEXT",
+        "rel_country": "TEXT",
+        "rel_date": "TEXT",
+        "rel_format": "TEXT",
+        "rel_track_count": "INTEGER",
+        "art_source": "TEXT",                   # caa | apple
     },
 }
 

@@ -74,7 +74,7 @@
   }
 
   // --- routing -----------------------------------------------------------------
-  const routes = { library: renderLibrary, vibe: renderVibe, playing: renderPlaying, stats: renderStats };
+  const routes = { library: renderLibrary, vibe: renderVibe, playing: renderPlaying, stats: renderStats, pressings: () => renderPressings() };
   function route() {
     const name = (location.hash || "#library").slice(1);
     const fn = routes[name] || renderLibrary;
@@ -151,8 +151,8 @@
     clearTimeout(enrichTimer);
     const box = $("#enrich");
     if (!box) return;
-    let e;
-    try { e = await api("enrich"); } catch { return; }
+    let e, p;
+    try { [e, p] = await Promise.all([api("enrich"), api("pressings?filter=none").catch(() => null)]); } catch { return; }
     const { job, counts } = e;
     const pending = counts.pending || 0;
     const missed = (counts.not_found || 0) + (counts.error || 0);
@@ -160,9 +160,11 @@
       const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
       box.innerHTML = `<div class="card" style="display:flex;flex-direction:column;gap:8px">
         <div class="row"><strong class="grow" style="font-size:14px">Fetching covers and album details</strong>
-          <span class="quiet" style="font-size:13px">${job.done} of ${job.total}</span></div>
+          <span class="quiet" style="font-size:13px">${job.done} of ${job.total}</span>
+          <button type="button" class="btn ghost" id="enrich-stop" style="min-height:32px;font-size:13px;padding:0 10px">Stop</button></div>
         <div class="bar"><span style="width:${pct}%"></span></div>
         <div class="quiet ellipsis" style="font-size:12px">${esc(job.current || "")}</div></div>`;
+      $("#enrich-stop").onclick = async () => { await api("enrich/stop", { method: "POST" }); drawEnrich(); };
       enrichTimer = setTimeout(async () => {
         if (!$("#enrich")) return;
         state.genres = await api("genres").catch(() => state.genres);
@@ -174,19 +176,28 @@
       state.genres = await api("genres").catch(() => state.genres);
       drawChips();
     }
+    const parts = [];
+    if (job.stopped_reason) parts.push(`<div class="card" style="font-size:14px;border:1px solid var(--danger)">${esc(job.stopped_reason)}</div>`);
     if (pending) {
-      box.innerHTML = `<button type="button" class="card link" id="enrich-go">
+      parts.push(`<button type="button" class="card link" id="enrich-go">
         <div class="grow"><div style="font-weight:600">Fetch covers and album details</div>
         <div class="quiet" style="font-size:13px">${pending} album${pending === 1 ? "" : "s"} still need art, track lists and genres</div></div>
-        <span style="color:var(--accent);font-weight:700">Start</span></button>`;
-      $("#enrich-go").onclick = async () => { await api("enrich/start", { method: "POST" }); drawEnrich(); };
-    } else if (missed) {
-      box.innerHTML = `<div class="quiet" style="font-size:13px;text-align:center">${missed} album${missed === 1 ? "" : "s"} couldn't be matched automatically.
-        Open one and use <strong>Fix match</strong>, or <button type="button" class="btn ghost" id="enrich-retry" style="min-height:32px;font-size:13px;padding:0 10px">try again</button></div>`;
-      $("#enrich-retry").onclick = async () => { await api("enrich/start?retry=true", { method: "POST" }); drawEnrich(); };
-    } else {
-      box.innerHTML = "";
+        <span style="color:var(--accent);font-weight:700">Start</span></button>`);
     }
+    if (p) {
+      const c = p.counts, todo = (c.review || 0) + (c.catalog || 0) + (c.unmatched || 0) - pending;
+      if (todo > 0 || c.locked) {
+        parts.push(`<a class="card link" href="#pressings">
+          <div class="grow"><div style="font-weight:600">Verify pressings</div>
+          <div class="quiet" style="font-size:13px">${c.locked} locked · ${c.catalog} ready to lock · ${c.review} to review${missed ? ` · ${missed} unmatched` : ""}</div></div>
+          <span style="color:var(--accent);font-weight:700">Open</span></a>`);
+      }
+    }
+    box.innerHTML = parts.join("");
+    box.style.display = parts.length ? "flex" : "";
+    box.style.flexDirection = "column";
+    box.style.gap = "10px";
+    if ($("#enrich-go")) $("#enrich-go").onclick = async () => { await api("enrich/start", { method: "POST" }); drawEnrich(); };
   }
 
   function drawChips() {
@@ -283,7 +294,6 @@
       skipped: `Skipped: ${a.enrich_note || ""}`,
       pending: "Waiting for cover and details",
     }[a.enrich_status] || "";
-    const mbSearch = `https://musicbrainz.org/search?type=release&method=indexed&query=${encodeURIComponent(`release:"${a.title}" AND artist:"${a.artist}"`)}`;
     sheet.innerHTML = `
       <div class="sheet-body">
         <div class="grabber" aria-hidden="true"></div>
@@ -307,20 +317,7 @@
             ${ICONS.heart.replace("<svg", `<svg style="${a.favorite ? "fill:var(--accent);stroke:var(--accent)" : ""}"`)}</button>
         </div>
         ${a.tracks.length ? `<ol class="tracklist">${a.tracks.map((t) => `<li><span class="n">${t.number}</span><span class="grow ellipsis">${esc(t.title || "")}</span><span class="quiet" style="font-size:13px">${fmtLen(t.duration_sec)}</span></li>`).join("")}</ol>` : ""}
-        <details class="card" id="fix" ${["not_found", "error"].includes(a.enrich_status) ? "open" : ""}>
-          <summary style="cursor:pointer;font-size:14px;min-height:28px">${esc(statusText)}</summary>
-          <form id="fix-form" style="display:flex;flex-direction:column;gap:10px;margin-top:10px">
-            <div class="quiet" style="font-size:13px">Wrong cover or tracks? Find the right pressing on
-              <a href="${mbSearch}" target="_blank" rel="noopener">MusicBrainz</a>, copy its link, and paste it here.</div>
-            <div class="field"><label for="fix-mbid">MusicBrainz release link</label>
-              <input id="fix-mbid" type="url" inputmode="url" placeholder="https://musicbrainz.org/release/…"></div>
-            <div class="form-error" id="fix-err" role="alert"></div>
-            <div class="row">
-              <button type="button" class="btn ghost grow" id="fix-again">Look up again</button>
-              <button type="submit" class="btn grow">Use this release</button>
-            </div>
-          </form>
-        </details>
+        ${pressingCard(a, statusText)}
         <form id="loc" class="card" style="display:flex;flex-direction:column;gap:10px">
           <h2>Where is this disc?</h2>
           <div class="field"><label for="loc-type">Location</label>
@@ -376,18 +373,7 @@
         if ((location.hash || "#library") === "#library") { await loadAlbums(); drawGrid(); }
       } catch (err) { $("#loc-err").textContent = err.message; }
     };
-    const refetch = async (mbid) => {
-      $("#fix-err").textContent = "Looking it up…";
-      try {
-        const r = await api(`albums/${a.id}/enrich`, { json: { mbid: mbid || null } });
-        if (["error", "not_found"].includes(r.result.status)) { $("#fix-err").textContent = r.result.note; return; }
-        toast(r.result.cover ? "Cover and details updated" : "Details updated; no cover art found");
-        openAlbum(a.id);
-        if ((location.hash || "#library") === "#library") { await loadAlbums(); drawGrid(); }
-      } catch (err) { $("#fix-err").textContent = err.message; }
-    };
-    $("#fix-form").onsubmit = (e) => { e.preventDefault(); refetch($("#fix-mbid").value.trim()); };
-    $("#fix-again").onclick = () => refetch(null);
+    bindPressingCard(a);
     $("#close").onclick = () => sheet.close();
     $("#play").onclick = () => play(a.id);
     if (a.resume) $("#resume").onclick = () => resume(a.id);
@@ -398,6 +384,161 @@
     if (!sheet.open) sheet.showModal();
   }
   sheet.addEventListener("click", (e) => { if (e.target === sheet) sheet.close(); });
+
+
+  // --- pressing card (album sheet) -------------------------------------------------
+  const normCat = (s) => String(s || "").toUpperCase().replace(/[^0-9A-Z]/g, "");
+  const catParts = (s) => String(s || "").split(/[(),/;]|\bor\b/i).map(normCat).filter((x) => x.length >= 4 && /\d/.test(x));
+  function catalogMismatch(a) {
+    const mine = a.catalog_verified || a.catalog_no;
+    if (!mine || !a.rel_catno || !catParts(mine).length) return false;
+    const rel = new Set(catParts(a.rel_catno));
+    return !catParts(mine).some((c) => rel.has(c));
+  }
+  function pressingBadge(a) {
+    if (a.pressing_locked) return `<span class="badge good">Locked</span>`;
+    if (a.match_method === "catalog") return `<span class="badge">Catalog match</span>`;
+    if (["matched", "manual"].includes(a.enrich_status)) return `<span class="badge warn">Check this</span>`;
+    return `<span class="badge">Not matched</span>`;
+  }
+  function releaseLine(r) {
+    return [r.label, r.country, r.date, r.format].filter(Boolean).map(esc).join(" · ");
+  }
+  function pressingCard(a, statusText) {
+    const mine = a.catalog_verified || a.catalog_no;
+    const matched = !!a.mbid_release;
+    const rel = matched
+      ? `${releaseLine({ label: a.rel_label, country: a.rel_country, date: a.rel_date, format: a.rel_format }) || "Release"}
+         <div class="quiet" style="font-size:13px">Cat. ${esc(a.rel_catno || "none listed")} · ${a.rel_track_count || "?"} tracks ·
+         <a href="https://musicbrainz.org/release/${esc(a.mbid_release)}" target="_blank" rel="noopener">MusicBrainz</a></div>`
+      : esc(statusText || "Not matched yet");
+    return `<section class="card" id="pressing" style="display:flex;flex-direction:column;gap:12px">
+      <div class="row"><h2 class="grow">Pressing</h2>${pressingBadge(a)}</div>
+      <dl class="kv">
+        <dt>On your disc</dt><dd>${esc(mine || "No catalog number yet")}${a.catalog_verified && a.catalog_no && normCat(a.catalog_verified) !== normCat(a.catalog_no)
+          ? `<div class="quiet" style="font-size:13px">Spreadsheet says ${esc(a.catalog_no)}</div>` : ""}</dd>
+        <dt>Barcode</dt><dd>${esc(a.barcode || a.rel_barcode || "—")}</dd>
+        <dt>Matched to</dt><dd>${rel}</dd>
+      </dl>
+      ${catalogMismatch(a) ? `<div class="warnbox">Your catalog number <strong>${esc(mine)}</strong> isn't on this release (${esc(a.rel_catno)}). It may be a different pressing.</div>` : ""}
+      ${a.art_source === "apple" ? `<div class="quiet" style="font-size:12px">Cover from Apple Music (standard album art).</div>` : ""}
+      <div class="row">
+        ${!a.pressing_locked && matched ? `<button type="button" class="btn primary grow" id="p-lock">Confirm &amp; lock</button>` : ""}
+        <button type="button" class="btn grow" id="p-change">${matched ? "Change pressing" : "Find pressing"}</button>
+        ${a.pressing_locked ? `<button type="button" class="btn ghost" id="p-unlock">Unlock</button>` : ""}
+      </div>
+      <form id="p-form" hidden style="display:flex;flex-direction:column;gap:10px">
+        <div class="quiet" style="font-size:13px">Type what's printed on the disc or spine. A barcode pins the exact release fastest.</div>
+        <div class="row" style="align-items:flex-end">
+          <div class="field grow"><label for="p-cat">Catalog number</label><input id="p-cat" type="text" autocomplete="off" value="${esc(mine || "")}"></div>
+          <div class="field grow"><label for="p-bc">Barcode</label><input id="p-bc" type="text" inputmode="numeric" autocomplete="off" value="${esc(a.barcode || "")}"></div>
+        </div>
+        <button type="submit" class="btn">Search MusicBrainz</button>
+        <div class="form-error" id="p-err" role="alert"></div>
+        <div id="p-results" style="display:flex;flex-direction:column;gap:10px"></div>
+        <details><summary class="quiet" style="font-size:13px;cursor:pointer;min-height:28px">Paste a MusicBrainz link instead</summary>
+          <div class="row" style="margin-top:8px"><label class="sr-only" for="p-link">MusicBrainz release link</label>
+            <input id="p-link" type="url" class="grow" placeholder="https://musicbrainz.org/release/…"
+              style="min-height:44px;border-radius:10px;border:1px solid var(--line);background:var(--ground);padding:0 12px;font-size:16px">
+            <button type="button" class="btn" id="p-link-lock">Lock</button></div></details>
+      </form>
+    </section>`;
+  }
+  function bindPressingCard(a) {
+    const after = async (msg) => {
+      toast(msg);
+      await openAlbum(a.id);
+      if ((location.hash || "#library") === "#pressings") renderPressings();
+      else if ((location.hash || "#library") === "#library") { await loadAlbums(); drawGrid(); }
+    };
+    const lock = async (mbid) => {
+      $("#p-err").textContent = "Locking and pulling details from that release…";
+      $("#p-form").hidden = false;
+      try {
+        await api(`albums/${a.id}/lock`, { json: { mbid, catalog_no: $("#p-cat").value.trim() || null, barcode: $("#p-bc").value.trim() || null } });
+        after("Pressing locked");
+      } catch (err) { $("#p-err").textContent = err.message; }
+    };
+    if ($("#p-lock")) $("#p-lock").onclick = async () => {
+      try {
+        await api(`albums/${a.id}/lock`, { json: { mbid: a.mbid_release, catalog_no: a.catalog_verified || a.catalog_no || null, barcode: a.barcode || null } });
+        after("Pressing locked");
+      } catch (err) { toast(err.message); }
+    };
+    if ($("#p-unlock")) $("#p-unlock").onclick = async () => { await api(`albums/${a.id}/unlock`, { method: "POST" }); after("Unlocked"); };
+    $("#p-change").onclick = () => { $("#p-form").hidden = !$("#p-form").hidden; if (!$("#p-form").hidden) $("#p-cat").focus(); };
+    $("#p-link-lock").onclick = () => lock($("#p-link").value.trim());
+    $("#p-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const params = new URLSearchParams();
+      if ($("#p-cat").value.trim()) params.set("catalog_no", $("#p-cat").value.trim());
+      if ($("#p-bc").value.trim()) params.set("barcode", $("#p-bc").value.trim());
+      $("#p-err").textContent = "Searching…";
+      $("#p-results").innerHTML = "";
+      let list;
+      try { list = await api(`albums/${a.id}/pressings?${params}`); } catch (err) { $("#p-err").textContent = err.message; return; }
+      $("#p-err").textContent = list.length ? "" : "Nothing found. Check the number, or try the barcode.";
+      $("#p-results").innerHTML = list.slice(0, 15).map((r) => `
+        <div class="cand">
+          <div style="font-weight:600">${releaseLine(r) || esc(r.title)}</div>
+          <div class="quiet" style="font-size:13px">${esc(r.title)}${r.artist ? ` — ${esc(r.artist)}` : ""}${r.disambiguation ? ` (${esc(r.disambiguation)})` : ""}</div>
+          <div style="font-size:13px">Cat. ${esc(r.catnos.join(", ") || "none")} · Barcode ${esc(r.barcode || "none")} · ${r.track_count || "?"} tracks</div>
+          <div class="row" style="flex-wrap:wrap;gap:6px">
+            ${r.barcode_match ? `<span class="badge good">Barcode match</span>` : ""}
+            ${r.catalog_match ? `<span class="badge good">Catalog match</span>` : ""}
+            ${r.is_current ? `<span class="badge">Current match</span>` : ""}
+            <span class="grow"></span>
+            <a href="${esc(r.url)}" target="_blank" rel="noopener" style="font-size:13px">Details</a>
+            <button type="button" class="btn primary" data-lock="${esc(r.id)}" style="min-height:36px">Lock this pressing</button>
+          </div>
+        </div>`).join("");
+      $("#p-results").querySelectorAll("[data-lock]").forEach((b) => (b.onclick = () => lock(b.dataset.lock)));
+    };
+  }
+
+  // --- Pressings review screen -----------------------------------------------------
+  const P_TABS = [["review", "To review"], ["catalog", "Ready to lock"], ["unmatched", "Not matched"], ["locked", "Locked"], ["skipped", "Skipped"]];
+  state.pFilter = "review";
+  async function renderPressings() {
+    let data;
+    try { data = await api(`pressings?filter=${state.pFilter}`); } catch (err) { return toast(err.message); }
+    const c = data.counts;
+    const hint = {
+      review: "Matched by artist and title only. Check each is the release you own, then lock it.",
+      catalog: "Matched on your catalog number, so these are very likely right. Lock them all, or spot-check first.",
+      unmatched: "No confident match yet. Open one and enter the catalog number or barcode.",
+      locked: "Confirmed. These are never re-matched, and re-importing the spreadsheet won't change them.",
+      skipped: "Rows that aren't single albums (lots). Split them in the spreadsheet first.",
+    }[state.pFilter];
+    view.onclick = null;
+    view.innerHTML = `
+      <a href="#library" class="btn ghost" style="align-self:flex-start;border:0;padding:0;color:var(--accent)">‹ Library</a>
+      <div><h1>Pressings</h1><p class="sub">Make sure every album matches the exact release on your shelf.</p></div>
+      <div class="chips" role="group" aria-label="Filter">${P_TABS.map(([v, t]) =>
+        `<button type="button" class="chip" data-f="${v}" aria-pressed="${state.pFilter === v}">${t} <span style="opacity:.75">${c[v] ?? 0}</span></button>`).join("")}</div>
+      <div class="quiet" style="font-size:14px">${hint}</div>
+      <div class="row">
+        ${state.pFilter === "catalog" && c.catalog ? `<button type="button" class="btn primary grow" id="lock-all">Lock all ${c.catalog}</button>` : ""}
+        <a class="btn ghost grow" href="api/pressings/export" download>Export to Excel</a>
+      </div>
+      <div id="p-list">${data.albums.length ? data.albums.map((r) => `
+        <button type="button" class="list-row" data-id="${r.id}" style="width:100%;background:none;border:0;border-bottom:1px solid var(--line);text-align:left;cursor:pointer;color:var(--ink)">
+          ${art(r, "sm")}
+          <div class="grow" style="min-width:0">
+            <div class="ellipsis" style="font-weight:600">${esc(r.title)} <span class="quiet" style="font-weight:400">· ${esc(r.artist)}</span></div>
+            <div class="ellipsis quiet" style="font-size:12px">Yours: ${esc(r.catalog_verified || r.catalog_no || "—")} · Release: ${esc(r.rel_catno || "—")}${r.rel_country || r.rel_date ? ` · ${esc([r.rel_country, (r.rel_date || "").slice(0, 4), r.rel_format].filter(Boolean).join(" "))}` : ""}</div>
+            ${r.catalog_mismatch ? `<div style="font-size:12px;color:var(--danger)">Catalog numbers don't match</div>` : ""}
+            ${["not_found", "error", "skipped"].includes(r.enrich_status) ? `<div class="quiet ellipsis" style="font-size:12px">${esc(r.enrich_note || "")}</div>` : ""}
+          </div>
+        </button>`).join("") : `<div class="empty"><strong>Nothing here</strong>${state.pFilter === "review" ? "Every matched album is either locked or matched on its catalog number." : ""}</div>`}</div>`;
+    view.querySelectorAll("[data-f]").forEach((b) => (b.onclick = () => { state.pFilter = b.dataset.f; renderPressings(); }));
+    view.querySelectorAll("[data-id]").forEach((b) => (b.onclick = () => openAlbum(Number(b.dataset.id))));
+    if ($("#lock-all")) $("#lock-all").onclick = async () => {
+      const r = await api("pressings/lock-catalog-matches", { method: "POST" });
+      toast(`Locked ${r.locked} pressings`);
+      renderPressings();
+    };
+  }
 
   async function play(albumId, fromTrack = 1) {
     try {

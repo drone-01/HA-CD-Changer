@@ -32,7 +32,8 @@ log = logging.getLogger(__name__)
 
 MB_BASE = "https://musicbrainz.org/ws/2"
 CAA_BASE = "https://coverartarchive.org"
-USER_AGENT = "DiscLibrary/0.2 ( https://github.com/drone-01/HA-CD-Changer )"
+APPLE_SEARCH = "https://itunes.apple.com/search"
+USER_AGENT = "DiscLibrary/0.3 ( https://github.com/drone-01/HA-CD-Changer )"
 MIN_SCORE = 105          # see pick_release(); a clean artist+title hit scores ~135
 MBID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
@@ -177,6 +178,48 @@ def bucket_genres(genres: list[dict]) -> tuple[str | None, str | None]:
     return ranked[0].title(), ranked[0].title()
 
 
+# --- release details -----------------------------------------------------------------
+def norm_catno(s: str | None) -> str:
+    return re.sub(r"[^0-9a-z]", "", (s or "").lower()).upper()
+
+
+def release_summary(r: dict) -> dict:
+    """The fields that tell one pressing from another, from a search hit or a lookup."""
+    labels = r.get("label-info") or []
+    media = r.get("media") or []
+    formats = [m.get("format") or "?" for m in media]
+    fmt = ", ".join(sorted(set(formats))) if formats else None
+    if len(formats) > 1:
+        fmt = f"{len(formats)}×{formats[0]}" if len(set(formats)) == 1 else fmt
+    tc = r.get("track-count") or sum((m.get("track-count") or len(m.get("tracks") or [])) for m in media) or None
+    credit = "".join((c.get("name") or "") + (c.get("joinphrase") or "") for c in r.get("artist-credit", []) or [])
+    return {
+        "id": r.get("id"),
+        "title": r.get("title"),
+        "artist": credit or None,
+        "date": r.get("date"),
+        "country": r.get("country"),
+        "status": r.get("status"),
+        "label": next((((li.get("label") or {}).get("name")) for li in labels if (li.get("label") or {}).get("name")), None),
+        "catnos": [li.get("catalog-number") for li in labels if li.get("catalog-number")],
+        "barcode": r.get("barcode") or None,
+        "format": fmt,
+        "track_count": tc,
+        "disambiguation": r.get("disambiguation") or None,
+        "score": r.get("score"),
+        "url": f"https://musicbrainz.org/release/{r.get('id')}",
+    }
+
+
+def best_apple_album(results: list[dict], artist: str, title: str) -> dict | None:
+    best, best_score = None, 0.0
+    for r in results:
+        s = similar(title, r.get("collectionName", "")) * 0.6 + similar(artist, r.get("artistName", "")) * 0.4
+        if s > best_score:
+            best, best_score = r, s
+    return best if best_score >= 0.8 else None
+
+
 # --- HTTP -------------------------------------------------------------------------------
 class MusicBrainz:
     def __init__(self, client: httpx.AsyncClient, min_interval: float = 1.1, clock=time.monotonic, sleep=asyncio.sleep):
@@ -193,7 +236,8 @@ class MusicBrainz:
                 await self.sleep(wait)
             self._last = self.clock()
             r = await self.client.get(f"{MB_BASE}/{path}", params={**params, "fmt": "json"},
-                                      headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+                                      headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                                      timeout=httpx.Timeout(20, connect=8))
             if r.status_code == 503:          # MusicBrainz rate limiting
                 await self.sleep(2 * (attempt + 1))
                 continue
@@ -202,10 +246,24 @@ class MusicBrainz:
         raise httpx.HTTPError("MusicBrainz kept answering 503")
 
     async def search_releases(self, artist: str, title: str) -> list[dict]:
-        esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
-        q = f'release:"{esc(title)}"'
+        q = f'release:"{_esc(title)}"'
         if _norm(artist) not in ("various artists", "various"):
-            q += f' AND artist:"{esc(artist)}"'
+            q += f' AND artist:"{_esc(artist)}"'
+        return (await self._get("release/", {"query": q, "limit": 25})).get("releases", [])
+
+    async def search_pressings(self, artist: str, title: str, catalog: str | None = None,
+                               barcode: str | None = None) -> list[dict]:
+        """Candidate releases for one album: by barcode, else catalog number, else artist and title."""
+        digits = re.sub(r"\D", "", barcode or "")
+        if digits:
+            q = f"barcode:{digits}"
+        elif catalog and catalog_candidates(catalog):
+            forms = {catalog.strip()} | set(catalog_candidates(catalog))
+            q = "(" + " OR ".join(f'catno:"{_esc(f)}"' for f in forms) + ")"
+            if _norm(artist) not in ("various artists", "various"):
+                q += f' AND artist:"{_esc(artist)}"'
+        else:
+            return await self.search_releases(artist, clean_title(title))
         return (await self._get("release/", {"query": q, "limit": 25})).get("releases", [])
 
     async def release(self, mbid: str) -> dict:
@@ -215,18 +273,44 @@ class MusicBrainz:
         return await self._get(f"release-group/{mbid}", {"inc": "genres"})
 
 
-async def fetch_cover(client: httpx.AsyncClient, release_mbid: str, rg_mbid: str | None) -> bytes | None:
-    urls = []
+def _esc(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+COVER_TIMEOUT = httpx.Timeout(10, connect=5)
+
+
+async def fetch_caa_cover(client: httpx.AsyncClient, release_mbid: str, rg_mbid: str | None,
+                          prefer_release: bool = False) -> bytes | None:
+    """Cover Art Archive. Raises httpx errors on network trouble so the caller can stop trying."""
+    urls = [f"{CAA_BASE}/release/{release_mbid}/front-500"]
     if rg_mbid:
-        urls.append(f"{CAA_BASE}/release-group/{rg_mbid}/front-500")
-    urls.append(f"{CAA_BASE}/release/{release_mbid}/front-500")
+        rg_url = f"{CAA_BASE}/release-group/{rg_mbid}/front-500"
+        urls = urls + [rg_url] if prefer_release else [rg_url] + urls
     for url in urls:
-        try:
-            r = await client.get(url, headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=30)
-            if r.status_code == 200 and r.content[:3] in (b"\xff\xd8\xff", b"\x89PN"):
-                return r.content
-        except httpx.HTTPError as exc:
-            log.info("cover fetch failed for %s: %s", url, exc)
+        r = await client.get(url, headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=COVER_TIMEOUT)
+        if r.status_code == 200 and r.content[:3] in (b"\xff\xd8\xff", b"\x89PN"):
+            return r.content
+    return None
+
+
+async def fetch_apple_cover(client: httpx.AsyncClient, artist: str, title: str) -> bytes | None:
+    """Apple Music artwork (US-hosted), 1200px. Matched on artist and album title."""
+    try:
+        r = await client.get(APPLE_SEARCH, params={"term": f"{artist} {clean_title(title)}", "entity": "album",
+                                                   "media": "music", "limit": 15, "country": "US"},
+                             headers={"User-Agent": USER_AGENT}, timeout=COVER_TIMEOUT)
+        if r.status_code != 200:
+            return None
+        hit = best_apple_album(r.json().get("results", []), artist, clean_title(title))
+        if not hit or not hit.get("artworkUrl100"):
+            return None
+        url = re.sub(r"/\d+x\d+bb\.(jpg|png)$", "/1200x1200bb.jpg", hit["artworkUrl100"])
+        img = await client.get(url, headers={"User-Agent": USER_AGENT}, timeout=COVER_TIMEOUT)
+        if img.status_code == 200 and img.content[:3] in (b"\xff\xd8\xff", b"\x89PN"):
+            return img.content
+    except (httpx.HTTPError, ValueError) as exc:
+        log.info("Apple artwork failed for %s - %s: %s", artist, title, exc)
     return None
 
 
@@ -242,12 +326,17 @@ class JobState:
     current: str | None = None
     started_at: float | None = None
     finished_at: float | None = None
+    stopped_reason: str | None = None
     log: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d["log"] = self.log[-20:]
         return d
+
+
+NETWORK_STRIKES = 3   # consecutive network failures before the job stops itself
+CAA_STRIKES = 3       # consecutive Cover Art Archive failures before switching to Apple for the rest of the run
 
 
 class Enricher:
@@ -259,6 +348,7 @@ class Enricher:
         self.mb_interval = mb_interval
         self.state = JobState()
         self._task: asyncio.Task | None = None
+        self._caa_failures = 0
 
     # --- public ---------------------------------------------------------------------
     def counts(self) -> dict:
@@ -272,39 +362,110 @@ class Enricher:
             return self.state
         statuses = ("pending", "not_found", "error") if retry_failed else ("pending",)
         ids = [r["id"] for r in self.db.query(
-            f"""SELECT id FROM albums WHERE media_kind = 'audio'
+            f"""SELECT id FROM albums WHERE media_kind = 'audio' AND pressing_locked = 0
                 AND enrich_status IN ({','.join('?' * len(statuses))}) ORDER BY artist, year""",
             statuses,
         )]
         self.state = JobState(running=True, total=len(ids), started_at=time.time())
+        self._caa_failures = 0
         self._task = asyncio.create_task(self._run(ids))
+        return self.state
+
+    def stop(self) -> JobState:
+        if self._task and not self._task.done():
+            self._task.cancel()
+            self.state.stopped_reason = "Stopped."
         return self.state
 
     async def wait(self) -> None:
         if self._task:
-            await self._task
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
     async def enrich_one(self, album_id: int, mbid: str | None = None) -> dict:
         async with self.client_factory() as client:
             mb = MusicBrainz(client, self.mb_interval)
             return await self._enrich(client, mb, album_id, mbid)
 
+    async def search_pressings(self, album_id: int, catalog: str | None, barcode: str | None) -> list[dict]:
+        a = self.db.one("SELECT * FROM albums WHERE id = ?", (album_id,))
+        if not a:
+            return []
+        async with self.client_factory() as client:
+            mb = MusicBrainz(client, self.mb_interval)
+            hits = await mb.search_pressings(a["artist"], a["title"], catalog, barcode)
+        want = set(catalog_candidates(catalog)) if catalog else set()
+        want_bc = re.sub(r"\D", "", barcode or "")
+        out = []
+        for h in hits:
+            s = release_summary(h)
+            s["catalog_match"] = bool(want & {norm_catno(c) for c in s["catnos"]})
+            s["barcode_match"] = bool(want_bc and re.sub(r"\D", "", s["barcode"] or "") == want_bc)
+            s["is_current"] = h.get("id") == a.get("mbid_release")
+            out.append(s)
+        out.sort(key=lambda s: (not s["barcode_match"], not s["catalog_match"], not (s["format"] or "").count("CD"),
+                                s["country"] != "US", s["date"] or "9999"))
+        return out
+
+    async def lock(self, album_id: int, mbid: str, catalog: str | None = None, barcode: str | None = None) -> dict:
+        """Pin an album to one MusicBrainz release and pull everything from that exact pressing."""
+        result = await self.enrich_one(album_id, mbid)
+        if result["status"] not in ("manual", "matched"):
+            return result
+        a = self.db.one("SELECT rel_catno, rel_barcode FROM albums WHERE id = ?", (album_id,))
+        self.db.execute(
+            """UPDATE albums SET pressing_locked = 1, locked_at = datetime('now'), enrich_status = 'manual',
+               catalog_verified = ?, barcode = ? WHERE id = ?""",
+            ((catalog or "").strip() or a["rel_catno"], re.sub(r"\D", "", barcode or "") or a["rel_barcode"], album_id),
+        )
+        return {**result, "status": "locked"}
+
+    def unlock(self, album_id: int) -> None:
+        self.db.execute("UPDATE albums SET pressing_locked = 0, locked_at = NULL WHERE id = ?", (album_id,))
+
     # --- internals --------------------------------------------------------------------
     async def _run(self, ids: list[int]) -> None:
+        strikes = 0
         try:
             async with self.client_factory() as client:
                 mb = MusicBrainz(client, self.mb_interval)
                 for album_id in ids:
                     result = await self._enrich(client, mb, album_id)
                     self.state.done += 1
-                    key = {"matched": "matched", "not_found": "not_found"}.get(result["status"], "errors")
+                    key = {"matched": "matched", "not_found": "not_found", "skipped": "not_found"}.get(
+                        result["status"], "errors")
                     setattr(self.state, key, getattr(self.state, key) + 1)
+                    strikes = strikes + 1 if (result.get("note") or "").startswith("Network error") else 0
+                    if strikes >= NETWORK_STRIKES:
+                        self.state.stopped_reason = (
+                            "Stopped: MusicBrainz can't be reached from Home Assistant. "
+                            "Check the network or firewall, then try again.")
+                        break
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.exception("enrichment job failed")
+            self.state.stopped_reason = "Stopped by an unexpected error; see the app log."
         finally:
             self.state.running = False
             self.state.current = None
             self.state.finished_at = time.time()
+
+    async def _cover(self, client: httpx.AsyncClient, a: dict, release_id: str, rg_id: str | None,
+                     prefer_release: bool) -> tuple[bytes | None, str | None]:
+        if self._caa_failures < CAA_STRIKES:
+            try:
+                img = await fetch_caa_cover(client, release_id, rg_id, prefer_release)
+                self._caa_failures = 0
+                if img:
+                    return img, "caa"
+            except httpx.HTTPError as exc:
+                self._caa_failures += 1
+                log.info("Cover Art Archive unreachable (%s/%s): %s", self._caa_failures, CAA_STRIKES, exc)
+        img = await fetch_apple_cover(client, a["artist"], a["title"])
+        return (img, "apple") if img else (None, None)
 
     async def _enrich(self, client: httpx.AsyncClient, mb: MusicBrainz, album_id: int, mbid: str | None = None) -> dict:
         a = self.db.one("SELECT * FROM albums WHERE id = ?", (album_id,))
@@ -319,14 +480,15 @@ class Enricher:
                 m = MBID_RE.search(mbid)
                 if not m:
                     return self._mark(album_id, "error", "That isn't a MusicBrainz release link or ID.")
-                release_id, why, status = m.group(0).lower(), "chosen by hand", "manual"
+                release_id, why, status, method = m.group(0).lower(), "chosen by hand", "manual", "manual"
             else:
                 title = clean_title(a["title"])
                 hits = await mb.search_releases(a["artist"], title)
-                best, why = pick_release(hits, a["artist"], title, a["catalog_no"])
+                best, why = pick_release(hits, a["artist"], title, a.get("catalog_verified") or a["catalog_no"])
                 if not best:
                     return self._mark(album_id, "not_found", why)
                 release_id, status = best["id"], "matched"
+                method = "catalog" if "catalog" in why else "title"
 
             rel = await mb.release(release_id)
             rg = rel.get("release-group") or {}
@@ -334,24 +496,26 @@ class Enricher:
             if rg.get("id"):
                 genres = (await mb.release_group(rg["id"])).get("genres", [])
             self._store(a, rel, genres, disc_number_hint(a["title"]))
-            cover = await fetch_cover(client, release_id, rg.get("id"))
+            cover, source = await self._cover(client, a, release_id, rg.get("id"), prefer_release=bool(mbid))
             art_url = None
             if cover:
                 (self.art_dir / f"{album_id}.jpg").write_bytes(cover)
                 art_url = f"art/{album_id}.jpg?v={int(time.time())}"
             self.db.execute(
                 """UPDATE albums SET mbid_release = ?, mbid_release_group = ?, art_url = COALESCE(?, art_url),
+                   art_source = COALESCE(?, art_source), match_method = ?,
                    enrich_status = ?, enrich_note = ?, enriched_at = datetime('now') WHERE id = ?""",
-                (release_id, rg.get("id"), art_url, status, why + ("" if cover else "; no cover art found"), album_id),
+                (release_id, rg.get("id"), art_url, source, method, status,
+                 why + ("" if cover else "; no cover art found"), album_id),
             )
             self.state.log.append(f"{a['artist']} - {a['title']}: {status} ({why})")
-            return {"status": status, "note": why, "cover": bool(cover)}
+            return {"status": status, "note": why, "cover": bool(cover), "art_source": source}
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 return self._mark(album_id, "not_found", "MusicBrainz has no release with that ID.")
             return self._mark(album_id, "error", f"MusicBrainz error {exc.response.status_code}")
         except httpx.HTTPError as exc:
-            return self._mark(album_id, "error", f"Network error: {exc}")
+            return self._mark(album_id, "error", f"Network error: {type(exc).__name__} {exc}".strip())
 
     def _mark(self, album_id: int, status: str, note: str) -> dict:
         self.db.execute(
@@ -372,6 +536,7 @@ class Enricher:
         bucket, top = bucket_genres(genres)
         rg = rel.get("release-group") or {}
         first = (rg.get("first-release-date") or "")[:4]
+        s = release_summary(rel)
         with self.db.connect() as con:
             con.execute("DELETE FROM tracks WHERE album_id = ?", (album["id"],))
             con.executemany(
@@ -381,8 +546,11 @@ class Enricher:
             con.execute(
                 """UPDATE albums SET runtime_sec = ?, original_year = ?,
                    genre = COALESCE(genre, ?), subgenre = COALESCE(subgenre, ?),
-                   label = COALESCE(label, ?), year = COALESCE(year, ?) WHERE id = ?""",
-                (runtime, int(first) if first.isdigit() else None, bucket, top,
-                 ((rel.get("label-info") or [{}])[0].get("label") or {}).get("name"),
-                 int(first) if first.isdigit() else None, album["id"]),
+                   label = COALESCE(label, ?), year = COALESCE(year, ?),
+                   rel_label = ?, rel_catno = ?, rel_barcode = ?, rel_country = ?, rel_date = ?,
+                   rel_format = ?, rel_track_count = ? WHERE id = ?""",
+                (runtime, int(first) if first.isdigit() else None, bucket, top, s["label"],
+                 int(first) if first.isdigit() else None,
+                 s["label"], ", ".join(s["catnos"]) or None, s["barcode"], s["country"], s["date"],
+                 s["format"], s["track_count"], album["id"]),
             )

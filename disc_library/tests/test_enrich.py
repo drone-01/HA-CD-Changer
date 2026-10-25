@@ -65,15 +65,38 @@ GENRES = {
 }
 
 
-def handler(calls):
+APPLE_JPEG = b"\xff\xd8\xff\xe1" + b"A" * 64
+
+
+def handler(calls, caa_down=False, mb_down=False):
     def handle(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
         assert request.headers["User-Agent"].startswith("DiscLibrary/")
         path = request.url.path
         if request.url.host == "coverartarchive.org":
+            if caa_down:
+                raise httpx.ConnectTimeout("timed out")
             return httpx.Response(200, content=JPEG) if DIRT_RG in path else httpx.Response(404)
+        if request.url.host == "itunes.apple.com":
+            term = request.url.params["term"]
+            if "Downward Spiral" in term or "Dirt" in term:
+                name = "The Downward Spiral" if "Downward" in term else "Dirt"
+                artist = "Nine Inch Nails" if "Downward" in term else "Alice In Chains"
+                return httpx.Response(200, json={"results": [
+                    {"collectionName": "Something Else", "artistName": "Other", "artworkUrl100": "https://is1-ssl.mzstatic.com/x/100x100bb.jpg"},
+                    {"collectionName": name, "artistName": artist, "artworkUrl100": "https://is1-ssl.mzstatic.com/a/b/100x100bb.jpg"}]})
+            return httpx.Response(200, json={"results": []})
+        if request.url.host == "is1-ssl.mzstatic.com":
+            assert path.endswith("/1200x1200bb.jpg")
+            return httpx.Response(200, content=APPLE_JPEG)
+        if mb_down:
+            raise httpx.ConnectTimeout("timed out")
         if path == "/ws/2/release/":
             q = request.url.params["query"]
+            if q.startswith("barcode:"):
+                return httpx.Response(200, json={"releases": [r for r in SEARCH["Dirt"] if r["id"] == DIRT_EU]})
+            if q.startswith("(catno:"):
+                return httpx.Response(200, json={"releases": SEARCH["Dirt"]})
             title = q.split('"')[1]
             return httpx.Response(200, json={"releases": SEARCH.get(title, [])})
         if path.startswith("/ws/2/release-group/"):
@@ -162,7 +185,10 @@ def test_job_enriches_library(db, workbook, enricher):
     assert dirt["runtime_sec"] == sum(t["duration_sec"] for t in tracks)
 
     tds = db.one("SELECT * FROM albums WHERE title = 'The Downward Spiral'")
-    assert tds["genre"] == "Industrial" and tds["art_url"] is None and "no cover art" in tds["enrich_note"]
+    assert tds["genre"] == "Industrial" and tds["art_source"] == "apple"   # no CAA art -> Apple fallback
+    assert (enricher.art_dir / f"{tds['id']}.jpg").read_bytes() == APPLE_JPEG
+    assert dirt["art_source"] == "caa" and dirt["match_method"] == "catalog" and tds["match_method"] == "catalog"
+    assert (dirt["rel_catno"], dirt["rel_country"], dirt["rel_format"]) == ("CK 52475", None, "CD")
 
     nevermind = db.one("SELECT * FROM albums WHERE title = 'Nevermind'")
     assert nevermind["enrich_status"] == "not_found"
@@ -170,7 +196,8 @@ def test_job_enriches_library(db, workbook, enricher):
 
     s = enricher.state
     assert (s.running, s.done, s.matched) == (False, s.total, 2)
-    assert all("musicbrainz.org" in c or "coverartarchive.org" in c for c in enricher.calls)
+    hosts = {httpx.URL(c).host for c in enricher.calls}
+    assert hosts <= {"musicbrainz.org", "coverartarchive.org", "itunes.apple.com", "is1-ssl.mzstatic.com"}
 
 
 def test_user_genre_is_kept(db, workbook, enricher):
@@ -205,3 +232,106 @@ def test_migration_adds_columns_to_old_db(tmp_path):
     db = Database(path)
     row = db.one("SELECT enrich_status, mbid_release FROM albums")
     assert row == {"enrich_status": "pending", "mbid_release": None}
+
+
+def make_enricher(db, tmp_path, **kw):
+    calls = []
+    e = Enricher(db, tmp_path / "art2", mb_interval=0,
+                 client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler(calls, **kw))))
+    e.calls = calls
+    return e
+
+
+def run_job(e):
+    async def go():
+        e.start()
+        await e.wait()
+    asyncio.run(go())
+
+
+def test_unreachable_cover_archive_switches_to_apple(db, workbook, tmp_path):
+    import_workbook(db, workbook)
+    e = make_enricher(db, tmp_path, caa_down=True)
+    run_job(e)
+    dirt = db.one("SELECT * FROM albums WHERE title = 'Dirt'")
+    assert dirt["art_source"] == "apple" and dirt["enrich_status"] == "matched"
+    caa_calls = [c for c in e.calls if "coverartarchive" in c]
+    assert len(caa_calls) <= 3   # gives up on the archive after a few failures instead of timing out on every album
+
+
+def test_job_stops_when_musicbrainz_unreachable(db, workbook, tmp_path):
+    import_workbook(db, workbook)
+    e = make_enricher(db, tmp_path, mb_down=True)
+    run_job(e)
+    assert e.state.done == 3 and "can't be reached" in e.state.stopped_reason
+    assert db.one("SELECT COUNT(*) AS n FROM albums WHERE enrich_status = 'pending'")["n"] >= 1
+
+
+def test_search_pressings_by_catalog_and_barcode(db, workbook, enricher):
+    import_workbook(db, workbook)
+    aid = db.one("SELECT id FROM albums WHERE title = 'Dirt'")["id"]
+    by_cat = asyncio.run(enricher.search_pressings(aid, "CK 52475", None))
+    assert by_cat[0]["id"] == DIRT_US and by_cat[0]["catalog_match"] and by_cat[0]["format"] == "CD"
+    assert by_cat[-1]["format"] == '12" Vinyl'                      # vinyl sorts last
+    by_bc = asyncio.run(enricher.search_pressings(aid, None, "0 74645-24752 6"))
+    assert [c["id"] for c in by_bc] == [DIRT_EU]
+    assert any(httpx.URL(c).params.get("query") == "barcode:074645247526" for c in enricher.calls)
+
+
+def test_lock_pins_release_and_job_leaves_it_alone(db, workbook, enricher):
+    import_workbook(db, workbook)
+    aid = db.one("SELECT id FROM albums WHERE title = 'Dirt'")["id"]
+    r = asyncio.run(enricher.lock(aid, f"https://musicbrainz.org/release/{DIRT_EU}", "472330 2", None))
+    assert r["status"] == "locked"
+    a = db.one("SELECT * FROM albums WHERE id = ?", (aid,))
+    assert (a["pressing_locked"], a["mbid_release"], a["catalog_verified"], a["catalog_no"]) == (1, DIRT_EU, "472330 2", "CK 52475")
+    db.execute("UPDATE albums SET enrich_status = 'pending' WHERE id = ?", (aid,))
+    run_job(enricher)
+    assert db.one("SELECT mbid_release FROM albums WHERE id = ?", (aid,))["mbid_release"] == DIRT_EU
+    enricher.unlock(aid)
+    assert db.one("SELECT pressing_locked FROM albums WHERE id = ?", (aid,))["pressing_locked"] == 0
+    bad = asyncio.run(enricher.lock(aid, "nope", None, None))
+    assert bad["status"] == "error"
+
+
+def test_reimport_never_touches_verified_pressing(db, workbook, enricher):
+    import_workbook(db, workbook)
+    aid = db.one("SELECT id FROM albums WHERE title = 'Dirt'")["id"]
+    asyncio.run(enricher.lock(aid, DIRT_US, None, None))
+    import_workbook(db, workbook)
+    a = db.one("SELECT pressing_locked, catalog_verified, mbid_release FROM albums WHERE id = ?", (aid,))
+    assert a == {"pressing_locked": 1, "catalog_verified": "CK 52475", "mbid_release": DIRT_US}
+
+
+def test_pressing_api(db, workbook, enricher, tmp_path, drivers):
+    from fastapi.testclient import TestClient
+    from openpyxl import load_workbook
+    from app.config import ChangerConfig, Settings
+    from app.ha_client import HAClient
+    from app.main import create_app
+    www = tmp_path / "www"
+    www.mkdir()
+    (www / "index.html").write_text("ok")
+    settings = Settings(data_dir=tmp_path, www_dir=www, changers=[ChangerConfig(1, "C1"), ChangerConfig(2, "C2")])
+    from app.db import Database
+    app = create_app(settings, drivers=drivers, ha=HAClient(token=""), enricher=Enricher(
+        Database(settings.db_path), tmp_path / "art3", mb_interval=0, client_factory=enricher.client_factory))
+    with TestClient(app) as c:
+        c.post("/api/import", files={"file": ("x.xlsx", workbook.read_bytes())})
+        dirt = next(a for a in c.get("/api/albums").json() if a["title"] == "Dirt")
+        r = c.post(f"/api/albums/{dirt['id']}/enrich", json={})
+        assert r.json()["result"]["status"] == "matched"
+        p = c.get("/api/pressings?filter=catalog").json()
+        assert p["counts"]["catalog"] >= 1 and any(a["title"] == "Dirt" for a in p["albums"])
+        cands = c.get(f"/api/albums/{dirt['id']}/pressings", params={"catalog_no": "CK 52475"}).json()
+        assert cands[0]["is_current"] and cands[0]["catalog_match"]
+        assert c.post("/api/pressings/lock-catalog-matches").json()["locked"] >= 1
+        assert c.get("/api/pressings?filter=locked").json()["counts"]["locked"] >= 1
+        assert c.post(f"/api/albums/{dirt['id']}/lock", json={"mbid": "garbage"}).status_code == 409
+        x = c.get("/api/pressings/export")
+        assert x.status_code == 200
+        out = tmp_path / "exp.xlsx"
+        out.write_bytes(x.content)
+        ws = load_workbook(out).active
+        rows = list(ws.iter_rows(values_only=True))
+        assert rows[0][0] == "Artist" and any(r[1] == "Dirt" and r[5] == "Yes" for r in rows)

@@ -8,6 +8,8 @@ headers, which tags each listening session with who played it.
 from __future__ import annotations
 
 import asyncio
+
+import httpx
 import logging
 import shutil
 import tempfile
@@ -52,6 +54,12 @@ class TagsBody(BaseModel):
     genre: str | None = None
     subgenre: str | None = None
     mood_tags: str | None = None
+
+
+class LockBody(BaseModel):
+    mbid: str                           # MusicBrainz release ID or link
+    catalog_no: str | None = None       # what's printed on your disc, if you typed it
+    barcode: str | None = None
 
 
 class EnrichBody(BaseModel):
@@ -134,6 +142,55 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
         if not a:
             raise HTTPException(404, "Album not found")
         return {"result": result, "album": a}
+
+    @app.post("/api/enrich/stop")
+    def enrich_stop():
+        enricher.stop()
+        return {"job": enricher.state.to_dict(), "counts": enricher.counts()}
+
+    # --- pressings: see, edit, confirm and lock the exact release you own --------
+    @app.get("/api/pressings")
+    def pressings(filter: str = "review"):
+        counts = library.pressing_counts()
+        return {"counts": counts, "albums": [] if filter == "none" else library.pressings(filter)}
+
+    @app.get("/api/albums/{album_id}/pressings")
+    async def pressing_candidates(album_id: int, catalog_no: str | None = None, barcode: str | None = None):
+        try:
+            return await enricher.search_pressings(album_id, catalog_no, barcode)
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"MusicBrainz couldn't be reached: {type(exc).__name__}") from exc
+
+    @app.post("/api/albums/{album_id}/lock")
+    async def lock_pressing(album_id: int, body: LockBody):
+        result = await enricher.lock(album_id, body.mbid, body.catalog_no, body.barcode)
+        if result["status"] != "locked":
+            raise HTTPException(409, result.get("note") or "Couldn't lock that release.")
+        return {"result": result, "album": library.album(album_id)}
+
+    @app.post("/api/albums/{album_id}/unlock")
+    def unlock_pressing(album_id: int):
+        enricher.unlock(album_id)
+        return library.album(album_id)
+
+    @app.post("/api/pressings/lock-catalog-matches")
+    def lock_catalog_matches():
+        ids = [r["id"] for r in library.pressings("catalog")]
+        db.execute(
+            f"""UPDATE albums SET pressing_locked = 1, locked_at = datetime('now'),
+                catalog_verified = COALESCE(catalog_verified, catalog_no),
+                barcode = COALESCE(barcode, rel_barcode)
+                WHERE id IN ({','.join('?' * len(ids)) or 'NULL'})""",
+            tuple(ids),
+        )
+        return {"locked": len(ids), "counts": library.pressing_counts()}
+
+    @app.get("/api/pressings/export")
+    def export_pressings():
+        path = Path(settings.data_dir) / "pressings-export.xlsx"
+        library.export_pressings(path)
+        return FileResponse(path, filename="CD_Collection-pressings.xlsx",
+                            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     @app.get("/art/{name}")
     def art(name: str):

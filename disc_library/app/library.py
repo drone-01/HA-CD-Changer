@@ -203,6 +203,63 @@ class Library:
             "most_played": most_played,
         }
 
+    # --- pressings ---------------------------------------------------------------
+    PRESSING_FILTERS = {
+        "review": """a.pressing_locked = 0 AND a.enrich_status IN ('matched', 'manual')
+                     AND COALESCE(a.match_method, 'title') != 'catalog'""",
+        "catalog": "a.pressing_locked = 0 AND a.enrich_status = 'matched' AND a.match_method = 'catalog'",
+        "locked": "a.pressing_locked = 1",
+        "unmatched": "a.pressing_locked = 0 AND a.enrich_status IN ('pending', 'not_found', 'error')",
+        "skipped": "a.enrich_status = 'skipped'",
+    }
+
+    def pressing_counts(self) -> dict:
+        base = "FROM albums a WHERE a.media_kind = 'audio' AND a.status = 'owned' AND "
+        return {k: self.db.one(f"SELECT COUNT(*) AS n {base} {w}")["n"] for k, w in self.PRESSING_FILTERS.items()}
+
+    def pressings(self, which: str = "review", limit: int = 1000) -> list[dict]:
+        where = self.PRESSING_FILTERS.get(which, self.PRESSING_FILTERS["review"])
+        rows = self.db.query(
+            f"""SELECT a.id, a.artist, a.title, a.year, a.format, a.catalog_no, a.catalog_verified, a.barcode,
+                       a.pressing_locked, a.match_method, a.enrich_status, a.enrich_note, a.art_url,
+                       a.rel_label, a.rel_catno, a.rel_barcode, a.rel_country, a.rel_date, a.rel_format,
+                       a.rel_track_count, a.mbid_release
+                FROM albums a WHERE a.media_kind = 'audio' AND a.status = 'owned' AND {where}
+                ORDER BY a.artist COLLATE NOCASE, a.year, a.title COLLATE NOCASE LIMIT ?""",
+            (limit,),
+        )
+        for r in rows:
+            mine = r["catalog_verified"] or r["catalog_no"]
+            r["catalog_mismatch"] = bool(mine and r["rel_catno"] and not (
+                set(_cat_forms(mine)) & set(_cat_forms(r["rel_catno"]))))
+        return rows
+
+    def export_pressings(self, path) -> int:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Pressings"
+        cols = ["Artist", "Album", "Your catalog no.", "Verified catalog no.", "Barcode", "Locked",
+                "Match", "Label", "Country", "Release date", "Format", "Tracks", "MusicBrainz release"]
+        ws.append(cols)
+        for c in ws[1]:
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor="FF2C2926")
+        rows = self.db.query(
+            """SELECT * FROM albums WHERE media_kind = 'audio' AND status = 'owned'
+               ORDER BY artist COLLATE NOCASE, year, title COLLATE NOCASE""")
+        for r in rows:
+            ws.append([r["artist"], r["title"], r["catalog_no"], r["catalog_verified"], r["barcode"] or r["rel_barcode"],
+                       "Yes" if r["pressing_locked"] else "", r["match_method"] or r["enrich_status"],
+                       r["rel_label"], r["rel_country"], r["rel_date"], r["rel_format"], r["rel_track_count"],
+                       f"https://musicbrainz.org/release/{r['mbid_release']}" if r["mbid_release"] else None])
+        for col, width in zip("ABCDEFGHIJKLM", (24, 34, 18, 18, 16, 8, 10, 22, 8, 12, 12, 7, 60)):
+            ws.column_dimensions[col].width = width
+        ws.freeze_panes = "A2"
+        wb.save(path)
+        return len(rows)
+
     # --- Vibe Sesh -------------------------------------------------------------
     def vibe(self, mood: str | None = None, energy: str | None = None, time_budget: str | None = None,
              familiarity: str | None = None, count: int = 3, seed: int | None = None) -> list[dict]:
@@ -260,6 +317,11 @@ class Library:
             {**r, "reason": " · ".join(reasons) if reasons else "In a changer and ready to play"}
             for _, r, reasons in scored[:count]
         ]
+
+
+def _cat_forms(s: str) -> list[str]:
+    from .enrich import catalog_candidates
+    return [c for part in s.split(",") for c in catalog_candidates(part)]
 
 
 def _streaks(days: list[date], today: date) -> tuple[int, int]:
