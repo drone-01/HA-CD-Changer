@@ -83,6 +83,8 @@ h2 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: 0.06em; text-
 .art .initials { position: absolute; left: 8px; bottom: 6px; font-size: 13px; font-weight: 700; opacity: 0.85; }
 .art.sm { width: 44px; height: 44px; flex-shrink: 0; border-radius: 6px; }
 .art.md { width: 64px; height: 64px; flex-shrink: 0; }
+.art.xl { width: 96px; height: 96px; }
+details summary::-webkit-details-marker { color: var(--quiet); }
 .art.lg { width: 100%; max-width: 420px; align-self: center; border-radius: 12px; }
 
 /* grid */

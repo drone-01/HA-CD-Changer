@@ -80,11 +80,29 @@ CREATE INDEX IF NOT EXISTS ix_albums_artist ON albums(artist, year);
 """
 
 
+# Columns added after v0.1.0; added in place on start-up so existing data is kept.
+MIGRATIONS = {
+    "albums": {
+        "mbid_release": "TEXT",
+        "mbid_release_group": "TEXT",
+        "original_year": "INTEGER",
+        "enrich_status": "TEXT NOT NULL DEFAULT 'pending'",   # pending | matched | manual | not_found | error | skipped
+        "enrich_note": "TEXT",
+        "enriched_at": "TEXT",
+    },
+}
+
+
 class Database:
     def __init__(self, path: Path | str):
         self.path = str(path)
         with self.connect() as con:
             con.executescript(SCHEMA)
+            for table, cols in MIGRATIONS.items():
+                have = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
+                for name, decl in cols.items():
+                    if name not in have:
+                        con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     @contextmanager
     def connect(self):

@@ -109,6 +109,7 @@
         <input id="q" type="search" placeholder="Artist, album or track" value="${esc(state.q)}" autocomplete="off">
       </div>
       <div class="chips" role="group" aria-label="Filter" id="chips"></div>
+      <div id="enrich"></div>
       <div id="continue"></div>
       <div class="row"><h2 class="grow" id="count">Albums</h2>
         <label class="sr-only" for="sort">Sort</label>
@@ -118,7 +119,7 @@
         </select>
       </div>
       <div class="grid" id="grid"></div>
-      <label class="btn ghost" style="align-self:center;margin-top:8px">${ICONS.upload}Re-import catalog
+      <label class="btn ghost" id="reimport-btn" style="align-self:center;margin-top:8px">${ICONS.upload}Re-import catalog
         <input type="file" id="reimport" accept=".xlsx,.xlsm" class="sr-only"></label>`;
     $("#sort").value = state.sort;
     $("#reimport").addEventListener("change", importCatalog);
@@ -141,6 +142,51 @@
     drawChips();
     drawContinue();
     drawGrid();
+    drawEnrich();
+  }
+
+  // --- metadata enrichment banner ------------------------------------------------
+  let enrichTimer;
+  async function drawEnrich() {
+    clearTimeout(enrichTimer);
+    const box = $("#enrich");
+    if (!box) return;
+    let e;
+    try { e = await api("enrich"); } catch { return; }
+    const { job, counts } = e;
+    const pending = counts.pending || 0;
+    const missed = (counts.not_found || 0) + (counts.error || 0);
+    if (job.running) {
+      const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
+      box.innerHTML = `<div class="card" style="display:flex;flex-direction:column;gap:8px">
+        <div class="row"><strong class="grow" style="font-size:14px">Fetching covers and album details</strong>
+          <span class="quiet" style="font-size:13px">${job.done} of ${job.total}</span></div>
+        <div class="bar"><span style="width:${pct}%"></span></div>
+        <div class="quiet ellipsis" style="font-size:12px">${esc(job.current || "")}</div></div>`;
+      enrichTimer = setTimeout(async () => {
+        if (!$("#enrich")) return;
+        state.genres = await api("genres").catch(() => state.genres);
+        await loadAlbums(); drawGrid(); drawChips(); drawEnrich();
+      }, 4000);
+      return;
+    }
+    if (job.finished_at && job.total && !pending) {
+      state.genres = await api("genres").catch(() => state.genres);
+      drawChips();
+    }
+    if (pending) {
+      box.innerHTML = `<button type="button" class="card link" id="enrich-go">
+        <div class="grow"><div style="font-weight:600">Fetch covers and album details</div>
+        <div class="quiet" style="font-size:13px">${pending} album${pending === 1 ? "" : "s"} still need art, track lists and genres</div></div>
+        <span style="color:var(--accent);font-weight:700">Start</span></button>`;
+      $("#enrich-go").onclick = async () => { await api("enrich/start", { method: "POST" }); drawEnrich(); };
+    } else if (missed) {
+      box.innerHTML = `<div class="quiet" style="font-size:13px;text-align:center">${missed} album${missed === 1 ? "" : "s"} couldn't be matched automatically.
+        Open one and use <strong>Fix match</strong>, or <button type="button" class="btn ghost" id="enrich-retry" style="min-height:32px;font-size:13px;padding:0 10px">try again</button></div>`;
+      $("#enrich-retry").onclick = async () => { await api("enrich/start?retry=true", { method: "POST" }); drawEnrich(); };
+    } else {
+      box.innerHTML = "";
+    }
   }
 
   function drawChips() {
@@ -184,6 +230,7 @@
     if (!grid) return;
     $("#count").textContent = `${state.albums.length} album${state.albums.length === 1 ? "" : "s"}`;
     if (!state.albums.length) {
+      if (!state.q && state.filter === "all" && $("#reimport-btn")) $("#reimport-btn").hidden = true;
       grid.outerHTML = state.q || state.filter !== "all"
         ? `<div class="empty" id="grid"><strong>No matches</strong>Try another search or filter.</div>`
         : `<div class="empty" id="grid"><strong>Your library is empty</strong>Import CD_Collection.xlsx to load the catalog.
@@ -212,7 +259,7 @@
     body.append("file", file);
     try {
       const r = await api("import", { method: "POST", body });
-      toast(`Imported ${r.rows} rows: ${r.added} new, ${r.updated} updated`);
+      toast(`Imported ${r.rows} rows: ${r.added} new, ${r.updated} updated${r.added ? ". Fetching covers now." : ""}`);
       renderLibrary();
     } catch (err) { toast(err.message); }
   }
@@ -223,12 +270,25 @@
     try { a = await api(`albums/${id}`); } catch (err) { return toast(err.message); }
     if (!state.changers.length) state.changers = await api("changers").catch(() => []);
     const playable = a.location_type === "changer";
-    const meta = [a.year, a.label, a.format, a.catalog_no].filter(Boolean).map(esc).join(" · ");
+    const yr = a.original_year && a.year && a.original_year !== a.year ? `${a.original_year} (this pressing ${a.year})` : (a.year || a.original_year);
+    const meta = [yr, a.label, a.format, a.catalog_no].filter(Boolean).map(esc).join(" · ");
+    const mins = a.runtime_sec ? `${Math.round(a.runtime_sec / 60)} min` : "";
+    const facts = [a.subgenre || a.genre, mins, a.tracks.length ? `${a.tracks.length} tracks` : ""].filter(Boolean).map(esc).join(" · ");
+    const fmtLen = (sec) => sec ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}` : "";
+    const statusText = {
+      matched: `Matched on MusicBrainz (${a.enrich_note || "artist and title"})`,
+      manual: "Matched by hand",
+      not_found: `Not matched yet: ${a.enrich_note || "no confident match"}`,
+      error: `Lookup failed: ${a.enrich_note || ""}`,
+      skipped: `Skipped: ${a.enrich_note || ""}`,
+      pending: "Waiting for cover and details",
+    }[a.enrich_status] || "";
+    const mbSearch = `https://musicbrainz.org/search?type=release&method=indexed&query=${encodeURIComponent(`release:"${a.title}" AND artist:"${a.artist}"`)}`;
     sheet.innerHTML = `
       <div class="sheet-body">
         <div class="grabber" aria-hidden="true"></div>
         <div class="row" style="align-items:flex-start;gap:14px">
-          ${art(a, "md")}
+          ${art(a, "md xl")}
           <div class="grow">
             <h1 id="sheet-title" style="font-size:22px">${esc(a.title)}</h1>
             <div class="quiet">${esc(a.artist)}</div>
@@ -236,6 +296,7 @@
           </div>
           <button type="button" class="icon-btn" id="close" aria-label="Close">${ICONS.down}</button>
         </div>
+        ${facts ? `<div style="font-size:14px">${facts}</div>` : ""}
         ${a.edition_notes ? `<div class="quiet" style="font-size:14px">${esc(a.edition_notes)}</div>` : ""}
         <div class="card" style="font-size:14px"><span class="quiet">Location:</span> ${esc(describeLocation(a))}
           ${a.full_listens ? `<span class="quiet"> · ${a.full_listens} full listen${a.full_listens === 1 ? "" : "s"}</span>` : ""}</div>
@@ -245,7 +306,21 @@
           <button type="button" class="icon-btn round" id="fav" aria-pressed="${!!a.favorite}" aria-label="Favorite">
             ${ICONS.heart.replace("<svg", `<svg style="${a.favorite ? "fill:var(--accent);stroke:var(--accent)" : ""}"`)}</button>
         </div>
-        ${a.tracks.length ? `<ol class="tracklist">${a.tracks.map((t) => `<li><span class="n">${t.number}</span><span class="grow ellipsis">${esc(t.title || "")}</span></li>`).join("")}</ol>` : ""}
+        ${a.tracks.length ? `<ol class="tracklist">${a.tracks.map((t) => `<li><span class="n">${t.number}</span><span class="grow ellipsis">${esc(t.title || "")}</span><span class="quiet" style="font-size:13px">${fmtLen(t.duration_sec)}</span></li>`).join("")}</ol>` : ""}
+        <details class="card" id="fix" ${["not_found", "error"].includes(a.enrich_status) ? "open" : ""}>
+          <summary style="cursor:pointer;font-size:14px;min-height:28px">${esc(statusText)}</summary>
+          <form id="fix-form" style="display:flex;flex-direction:column;gap:10px;margin-top:10px">
+            <div class="quiet" style="font-size:13px">Wrong cover or tracks? Find the right pressing on
+              <a href="${mbSearch}" target="_blank" rel="noopener">MusicBrainz</a>, copy its link, and paste it here.</div>
+            <div class="field"><label for="fix-mbid">MusicBrainz release link</label>
+              <input id="fix-mbid" type="url" inputmode="url" placeholder="https://musicbrainz.org/release/…"></div>
+            <div class="form-error" id="fix-err" role="alert"></div>
+            <div class="row">
+              <button type="button" class="btn ghost grow" id="fix-again">Look up again</button>
+              <button type="submit" class="btn grow">Use this release</button>
+            </div>
+          </form>
+        </details>
         <form id="loc" class="card" style="display:flex;flex-direction:column;gap:10px">
           <h2>Where is this disc?</h2>
           <div class="field"><label for="loc-type">Location</label>
@@ -301,6 +376,18 @@
         if ((location.hash || "#library") === "#library") { await loadAlbums(); drawGrid(); }
       } catch (err) { $("#loc-err").textContent = err.message; }
     };
+    const refetch = async (mbid) => {
+      $("#fix-err").textContent = "Looking it up…";
+      try {
+        const r = await api(`albums/${a.id}/enrich`, { json: { mbid: mbid || null } });
+        if (["error", "not_found"].includes(r.result.status)) { $("#fix-err").textContent = r.result.note; return; }
+        toast(r.result.cover ? "Cover and details updated" : "Details updated; no cover art found");
+        openAlbum(a.id);
+        if ((location.hash || "#library") === "#library") { await loadAlbums(); drawGrid(); }
+      } catch (err) { $("#fix-err").textContent = err.message; }
+    };
+    $("#fix-form").onsubmit = (e) => { e.preventDefault(); refetch($("#fix-mbid").value.trim()); };
+    $("#fix-again").onclick = () => refetch(null);
     $("#close").onclick = () => sheet.close();
     $("#play").onclick = () => play(a.id);
     if (a.resume) $("#resume").onclick = () => resume(a.id);

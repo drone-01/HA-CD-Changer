@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from .config import Settings, load_settings
 from .db import Database
 from .drivers import build_driver
+from .enrich import Enricher
 from .ha_client import HAClient
 from .importer import import_workbook
 from .library import Library, LocationError
@@ -53,6 +54,10 @@ class TagsBody(BaseModel):
     mood_tags: str | None = None
 
 
+class EnrichBody(BaseModel):
+    mbid: str | None = None             # a MusicBrainz release ID or link, to fix a wrong match
+
+
 class VibeBody(BaseModel):
     mood: str | None = None
     energy: str | None = None
@@ -76,7 +81,8 @@ def _since(range_: str) -> str | None:
     return None
 
 
-def create_app(settings: Settings | None = None, drivers: dict | None = None, ha: HAClient | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, drivers: dict | None = None, ha: HAClient | None = None,
+               enricher: Enricher | None = None) -> FastAPI:
     settings = settings or load_settings()
     db = Database(settings.db_path)
     # A session still open from before a restart can't be followed any more.
@@ -85,6 +91,8 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
     drivers = drivers or {c.id: build_driver(c, settings) for c in settings.changers}
     library = Library(db, list(drivers))
     player = Player(db, drivers, ha if ha is not None else HAClient(), settings.listen_script)
+    art_dir = Path(settings.data_dir) / "art"
+    enricher = enricher or Enricher(db, art_dir)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -107,6 +115,32 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
 
     app = FastAPI(title="Disc Library", lifespan=lifespan)
     app.state.db, app.state.library, app.state.player = db, library, player
+    app.state.enricher = enricher
+
+    # --- metadata (cover art, track lists, genres) -----------------------------
+    @app.get("/api/enrich")
+    def enrich_status():
+        return {"job": enricher.state.to_dict(), "counts": enricher.counts()}
+
+    @app.post("/api/enrich/start")
+    async def enrich_start(retry: bool = False):
+        enricher.start(retry_failed=retry)
+        return {"job": enricher.state.to_dict(), "counts": enricher.counts()}
+
+    @app.post("/api/albums/{album_id}/enrich")
+    async def enrich_album(album_id: int, body: EnrichBody):
+        result = await enricher.enrich_one(album_id, body.mbid)
+        a = library.album(album_id)
+        if not a:
+            raise HTTPException(404, "Album not found")
+        return {"result": result, "album": a}
+
+    @app.get("/art/{name}")
+    def art(name: str):
+        path = (enricher.art_dir / name).resolve()
+        if path.parent != enricher.art_dir.resolve() or not path.is_file():
+            raise HTTPException(404, "No cover")
+        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=31536000"})
 
     # --- library ---------------------------------------------------------------
     @app.get("/api/albums")
@@ -170,7 +204,10 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
             shutil.copyfileobj(file.file, tmp)
             path = Path(tmp.name)
         try:
-            return import_workbook(db, path)
+            result = import_workbook(db, path)
+            if result["added"]:
+                enricher.start()  # fetch covers and details for the new albums in the background
+            return result
         finally:
             path.unlink(missing_ok=True)
 

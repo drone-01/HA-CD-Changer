@@ -4,7 +4,7 @@ An album-first app for browsing and playing a physical disc collection across
 two Sony BDP-CX7000ES 400-disc changers. It runs as a Home Assistant add-on
 with its own sidebar panel, designed for the iPhone first.
 
-## What works today (v0.1.0)
+## What works today (v0.2.0)
 
 | Area | Status |
 | --- | --- |
@@ -21,7 +21,7 @@ with its own sidebar panel, designed for the iPhone first.
 | Phone-first web app (Library, Vibe Sesh, Playing, Stats, album sheet) | Done |
 | Simulated changers for testing without hardware | Done |
 | **Real CX7000ES control** | **Shell only, waiting on Sony's protocol sheet (Phase 1)** |
-| Cover art, track lists, genre tagging | Phase 2 |
+| Cover art, track lists, runtimes, genres (MusicBrainz + Cover Art Archive), fix-a-match | Done (v0.2.0) |
 | HA `media_player` entities (Theatrium, voice, dashboard card) | Phase 2 |
 | Theater dashboard and Listen/Watch scripts | Phase 0, built in HA |
 
@@ -74,6 +74,20 @@ pip install -r requirements.txt pytest
 python -m pytest -q
 DL_DATA_DIR=./data python -m app.main     # http://localhost:8099
 ```
+
+## Album metadata
+
+After an import the app fetches cover art, track lists, runtimes and genres in the background
+(about 4 seconds an album, so roughly 30 minutes for the whole collection; MusicBrainz allows one
+request a second). Covers are saved in the add-on's data folder, so the grid stays fast offline.
+
+- Matching uses artist, title and catalog number; a catalog match (including both numbers on
+  BMG/Columbia House club editions) pins the exact pressing.
+- Notes in titles ("— Disc 2", "— second copy", "(CD single)") are ignored for matching, and the
+  disc number picks the right track list.
+- Anything uncertain is left unmatched rather than guessed. Open the album, tap **Fix match**,
+  and paste the MusicBrainz release link.
+- Genres you set yourself are never overwritten.
 
 ## Notes
 

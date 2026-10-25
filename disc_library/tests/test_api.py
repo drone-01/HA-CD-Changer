@@ -1,8 +1,12 @@
 from fastapi.testclient import TestClient
 
 from app.config import ChangerConfig, Settings
+import httpx
+
+from app.enrich import Enricher
 from app.ha_client import HAClient
 from app.main import create_app
+from app.db import Database
 
 
 def make_client(tmp_path, drivers):
@@ -11,7 +15,10 @@ def make_client(tmp_path, drivers):
     (www / "index.html").write_text("<!doctype html><title>Disc Library</title>")
     settings = Settings(data_dir=tmp_path, www_dir=www,
                         changers=[ChangerConfig(1, "Changer 1"), ChangerConfig(2, "Changer 2")])
-    return TestClient(create_app(settings, drivers=drivers, ha=HAClient(token="")))
+    offline = Enricher(Database(settings.db_path), tmp_path / "art", mb_interval=0,
+                       client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(
+                           lambda req: httpx.Response(200, json={"releases": []}))))
+    return TestClient(create_app(settings, drivers=drivers, ha=HAClient(token=""), enricher=offline))
 
 
 def test_end_to_end(tmp_path, drivers, workbook):
