@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#131211">
+<title>Disc Library</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+  <main id="view" tabindex="-1"></main>
+
+  <a id="mini" class="mini" href="#playing" hidden>
+    <div class="art sm" id="mini-art"></div>
+    <div class="mini-text">
+      <div class="mini-title" id="mini-title"></div>
+      <div class="mini-sub" id="mini-sub"></div>
+    </div>
+    <button type="button" class="icon-btn" id="mini-toggle" aria-label="Pause"></button>
+  </a>
+
+  <nav class="tabs" aria-label="Main">
+    <a href="#library" data-tab="library">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+      <span>Library</span></a>
+    <a href="#vibe" data-tab="vibe">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+      <span>Vibe Sesh</span></a>
+    <a href="#playing" data-tab="playing">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2"/></svg>
+      <span>Playing</span></a>
+    <a href="#stats" data-tab="stats">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V11M12 20V5M19 20v-6"/></svg>
+      <span>Stats</span></a>
+  </nav>
+</div>
+
+<dialog id="sheet" aria-labelledby="sheet-title"></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
