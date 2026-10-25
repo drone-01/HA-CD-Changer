@@ -738,8 +738,48 @@
         <div class="genre-row"><span class="ellipsis">${esc(g.genre)}</span><div class="bar"><span style="width:${(g.full_listens / maxG) * 100}%"></span></div><span class="quiet" style="text-align:right">${g.full_listens}</span></div>`).join("")}</div>` : ""}
       ${s.most_played.length ? `<h2>Most played</h2><div>${s.most_played.map((m, i) => `
         <div class="list-row" style="font-size:14px"><span class="quiet" style="width:18px">${i + 1}</span>
-          <span class="grow ellipsis">${esc(m.title)} <span class="quiet">· ${esc(m.artist)}</span></span><span class="quiet">${m.plays} play${m.plays === 1 ? "" : "s"}</span></div>`).join("")}</div>` : ""}`;
+          <span class="grow ellipsis">${esc(m.title)} <span class="quiet">· ${esc(m.artist)}</span></span><span class="quiet">${m.plays} play${m.plays === 1 ? "" : "s"}</span></div>`).join("")}</div>` : ""}
+      <h2>Storage</h2><div id="storage"><div class="empty">Loading…</div></div>`;
     view.querySelectorAll("[data-resume]").forEach((b) => (b.onclick = () => resume(Number(b.dataset.resume))));
+    renderStorage();
+  }
+
+  function fmtBytes(n) {
+    if (!n) return "0 KB";
+    const u = ["bytes", "KB", "MB", "GB", "TB"];
+    const i = Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+    const v = n / 1024 ** i;
+    return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${u[i]}`;
+  }
+
+  async function renderStorage() {
+    const box = $("#storage");
+    if (!box) return;
+    let st;
+    try { st = await api("storage"); } catch (err) { box.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+    const parts = [
+      ["Cover art", st.covers_bytes, "var(--accent)"],
+      ["Library database", st.database_bytes, "var(--good)"],
+      ["Settings & exports", st.other_bytes, "var(--quiet)"],
+    ];
+    const tot = Math.max(1, st.total_bytes);
+    const src = st.covers_by_source || {};
+    const srcNames = { caa: "Cover Art Archive", apple: "Apple Music", unknown: "earlier sync" };
+    const srcText = Object.entries(src).map(([k, v]) => `${v} from ${srcNames[k] || k}`).join(" · ");
+    const r = st.records;
+    const disk = st.disk;
+    box.innerHTML = `
+      <div class="kpis">
+        <div class="kpi"><div class="quiet" style="font-size:13px">Disc Library uses</div><div class="v">${fmtBytes(st.total_bytes)}</div></div>
+        ${disk ? `<div class="kpi"><div class="quiet" style="font-size:13px">Free space</div><div class="v">${fmtBytes(disk.free)}</div><div class="quiet" style="font-size:12px">of ${fmtBytes(disk.total)} on Home Assistant</div></div>` : ""}
+      </div>
+      <div class="storebar" role="img" aria-label="Storage breakdown">${parts.map(([t, b, c]) =>
+        b ? `<span style="width:${(b / tot) * 100}%;background:${c}" title="${t}"></span>` : "").join("")}</div>
+      <div>${parts.map(([t, b, c]) => `
+        <div class="list-row" style="font-size:14px"><span class="dot" style="background:${c}"></span>
+          <span class="grow">${t}${t === "Cover art" ? `<div class="quiet" style="font-size:12px">${st.covers} image${st.covers === 1 ? "" : "s"}${srcText ? ` · ${esc(srcText)}` : ""}</div>` : ""}${t === "Library database" ? `<div class="quiet" style="font-size:12px">${r.albums} albums · ${r.tracks.toLocaleString()} tracks · ${r.listens} listens · ${r.locked_pressings} locked pressings</div>` : ""}</span>
+          <span class="quiet">${fmtBytes(b)}</span></div>`).join("")}</div>
+      ${disk ? `<p class="quiet" style="font-size:12px">Home Assistant's disk: ${fmtBytes(disk.used)} used of ${fmtBytes(disk.total)}. Disc Library is ${((st.total_bytes / Math.max(1, disk.total)) * 100).toFixed(2)}% of it.</p>` : ""}`;
   }
 
   // --- start -----------------------------------------------------------------

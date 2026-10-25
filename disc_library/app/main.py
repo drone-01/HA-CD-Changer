@@ -320,6 +320,49 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
     def vibe(body: VibeBody):
         return library.vibe(body.mood, body.energy, body.time_budget, body.familiarity, seed=body.seed)
 
+    @app.get("/api/storage")
+    def storage():
+        data = Path(settings.data_dir)
+        db_file = Path(settings.db_path)
+
+        def size(p: Path) -> int:
+            try:
+                return p.stat().st_size
+            except OSError:
+                return 0
+
+        db_bytes = sum(size(Path(str(db_file) + s)) for s in ("", "-wal", "-shm", "-journal"))
+        covers = [p for p in enricher.art_dir.glob("*.jpg")] if enricher.art_dir.exists() else []
+        art_bytes = sum(size(p) for p in covers)
+        total = 0
+        for p in data.rglob("*"):
+            if p.is_file():
+                total += size(p)
+        other = max(0, total - db_bytes - art_bytes)
+        try:
+            du = shutil.disk_usage(data)
+            disk = {"total": du.total, "used": du.used, "free": du.free}
+        except OSError:
+            disk = None
+        n = lambda sql: db.one(sql)["n"]  # noqa: E731
+        return {
+            "total_bytes": total,
+            "database_bytes": db_bytes,
+            "covers_bytes": art_bytes,
+            "other_bytes": other,
+            "covers": len(covers),
+            "covers_by_source": {r["src"]: r["n"] for r in db.query(
+                "SELECT COALESCE(art_source,'unknown') AS src, COUNT(*) AS n FROM albums "
+                "WHERE art_url IS NOT NULL GROUP BY src")},
+            "records": {
+                "albums": n("SELECT COUNT(*) AS n FROM albums"),
+                "tracks": n("SELECT COUNT(*) AS n FROM tracks"),
+                "listens": n("SELECT COUNT(*) AS n FROM sessions"),
+                "locked_pressings": n("SELECT COUNT(*) AS n FROM albums WHERE pressing_locked = 1"),
+            },
+            "disk": disk,
+        }
+
     @app.get("/api/health")
     def health():
         return {"ok": True, "albums": db.one("SELECT COUNT(*) AS n FROM albums")["n"]}

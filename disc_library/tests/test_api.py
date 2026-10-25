@@ -57,3 +57,19 @@ def test_end_to_end(tmp_path, drivers, workbook):
         assert [ch["used"] for ch in changers] == [1, 0]
         assert c.post("/api/vibe", json={"familiarity": "favorite"}).json()[0]["reason"].startswith("A favorite")
         assert c.get("/api/stats?range=year").json()["partial_listens"] == 1
+
+
+def test_storage(tmp_path, drivers, workbook):
+    with make_client(tmp_path, drivers) as c:
+        c.post("/api/import", files={"file": ("CD_Collection.xlsx", workbook.read_bytes())})
+        (tmp_path / "art").mkdir(exist_ok=True)
+        (tmp_path / "art" / "1.jpg").write_bytes(b"x" * 2048)
+        r = c.get("/api/storage")
+    assert r.status_code == 200
+    s = r.json()
+    assert s["covers"] == 1 and s["covers_bytes"] == 2048
+    assert s["records"]["albums"] == 7
+    assert s["database_bytes"] > 0
+    assert s["total_bytes"] >= s["database_bytes"] + s["covers_bytes"]
+    assert s["records"]["albums"] >= 0 and "tracks" in s["records"]
+    assert s["disk"] is None or s["disk"]["free"] > 0
