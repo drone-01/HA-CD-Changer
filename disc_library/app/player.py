@@ -41,7 +41,8 @@ class Active:
 
 
 def score_full_listen(*, played_sec: float, runtime_sec: int | None, start_track: int,
-                      last_track: int, track_count: int | None, finished: bool) -> bool:
+                      last_track: int, track_count: int | None, finished: bool,
+                      ratio: float = FULL_LISTEN_RATIO) -> bool:
     """Apply the 90% rule.
 
     With a known runtime, compare time actually played. Without one (no
@@ -49,20 +50,21 @@ def score_full_listen(*, played_sec: float, runtime_sec: int | None, start_track
     no track count either, only a start-to-finish play counts.
     """
     if runtime_sec:
-        return played_sec >= FULL_LISTEN_RATIO * runtime_sec
+        return played_sec >= ratio * runtime_sec
     if track_count:
         heard = (last_track - start_track) + (1 if finished else 0)
-        return heard >= FULL_LISTEN_RATIO * track_count
+        return heard >= ratio * track_count
     return finished and start_track == 1
 
 
 class Player:
     def __init__(self, db: Database, drivers: dict[int, ChangerDriver], ha: HAClient | None = None,
-                 listen_script: str | None = None, clock=time.monotonic):
+                 listen_script: str | None = None, clock=time.monotonic, prefs=None):
         self.db = db
         self.drivers = drivers
         self.ha = ha
         self.listen_script = listen_script
+        self.prefs = prefs
         self.clock = clock
         self.active: Active | None = None
         self._lock = asyncio.Lock()
@@ -102,8 +104,9 @@ class Player:
                             await other.stop()
                     except NotImplementedError:
                         pass
-            if self.ha and self.listen_script:
-                await self.ha.run_script(self.listen_script)
+            script = (self.prefs.get("listen_script") if self.prefs else "") or self.listen_script
+            if self.ha and script:
+                await self.ha.run_script(script)
             try:
                 await driver.load_and_play(disc["slot"], from_track, track_count)
             except NotImplementedError as exc:
@@ -184,6 +187,7 @@ class Player:
         full = score_full_listen(
             played_sec=a.played_sec, runtime_sec=a.runtime_sec, start_track=a.start_track,
             last_track=a.last_track, track_count=a.track_count, finished=(reason == "finished"),
+            ratio=(self.prefs.get("full_listen_percent") / 100) if self.prefs else FULL_LISTEN_RATIO,
         )
         self.db.execute(
             """UPDATE sessions SET ended_at = datetime('now'), last_track = ?, played_sec = ?,

@@ -190,3 +190,10 @@ def test_vibe_only_picks_playable_albums_with_honest_reasons(db, setup):
     picks = lib.vibe(familiarity="rediscover", seed=1)
     assert {p["title"] for p in picks} == {"The Downward Spiral", "Dirt"}
     assert all("Not played here yet" in p["reason"] for p in picks)
+
+
+def test_full_listen_ratio_is_adjustable():
+    from app.player import score_full_listen
+    kw = dict(runtime_sec=1000, start_track=1, last_track=5, track_count=10, finished=False)
+    assert not score_full_listen(played_sec=800, **kw)
+    assert score_full_listen(played_sec=800, ratio=0.75, **kw)

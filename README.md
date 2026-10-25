@@ -4,7 +4,7 @@ An album-first app for browsing and playing a physical disc collection across
 two Sony BDP-CX7000ES 400-disc changers. It runs as a Home Assistant add-on
 with its own sidebar panel, designed for the iPhone first.
 
-## What works today (v0.3.0)
+## What works today (v0.4.0)
 
 | Area | Status |
 | --- | --- |
@@ -89,6 +89,13 @@ request a second). Covers are saved in the add-on's data folder, so the grid sta
 - Anything uncertain is left unmatched rather than guessed.
 - If the Cover Art Archive can't be reached, covers come from Apple Music instead (matched on artist
   and album). The job stops itself with a message if MusicBrainz can't be reached at all.
+
+## Settings
+
+The **Settings** tab holds what you can change without restarting: the full-listen threshold,
+the theater script, Apple Music cover fallback, whether new albums are looked up after an import,
+album lookup controls, spreadsheet import, pressing export, changer status, storage used, and the
+version. Changer names and addresses stay in the app configuration in Home Assistant.
 
 ## Pressings
 

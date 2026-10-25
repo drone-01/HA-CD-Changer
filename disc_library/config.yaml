@@ -1,5 +1,5 @@
 name: "Disc Library"
-version: "0.3.1"
+version: "0.4.0"
 slug: "disc_library"
 description: "Browse and play your physical album collection across Sony disc changers."
 url: "https://github.com/drone-01/HA-CD-Changer"

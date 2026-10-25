@@ -340,8 +340,9 @@ CAA_STRIKES = 3       # consecutive Cover Art Archive failures before switching 
 
 
 class Enricher:
-    def __init__(self, db: Database, art_dir: Path, client_factory=None, mb_interval: float = 1.1):
+    def __init__(self, db: Database, art_dir: Path, client_factory=None, mb_interval: float = 1.1, prefs=None):
         self.db = db
+        self.prefs = prefs
         self.art_dir = Path(art_dir)
         self.art_dir.mkdir(parents=True, exist_ok=True)
         self.client_factory = client_factory or (lambda: httpx.AsyncClient(timeout=30))
@@ -464,6 +465,8 @@ class Enricher:
             except httpx.HTTPError as exc:
                 self._caa_failures += 1
                 log.info("Cover Art Archive unreachable (%s/%s): %s", self._caa_failures, CAA_STRIKES, exc)
+        if self.prefs and not self.prefs.get("apple_covers"):
+            return None, None
         img = await fetch_apple_cover(client, a["artist"], a["title"])
         return (img, "apple") if img else (None, None)
 

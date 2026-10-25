@@ -22,12 +22,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import __version__
 from .config import Settings, load_settings
 from .db import Database
 from .drivers import build_driver
 from .enrich import Enricher
 from .ha_client import HAClient
 from .importer import import_workbook
+from .prefs import Prefs, PrefsError
 from .library import Library, LocationError
 from .player import PlayError, Player
 
@@ -98,9 +100,12 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
                   WHERE ended_at IS NULL""")
     drivers = drivers or {c.id: build_driver(c, settings) for c in settings.changers}
     library = Library(db, list(drivers))
-    player = Player(db, drivers, ha if ha is not None else HAClient(), settings.listen_script)
+    prefs = Prefs(db)
+    player = Player(db, drivers, ha if ha is not None else HAClient(), settings.listen_script, prefs=prefs)
     art_dir = Path(settings.data_dir) / "art"
     enricher = enricher or Enricher(db, art_dir)
+    if enricher.prefs is None:
+        enricher.prefs = prefs
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -262,7 +267,7 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
             path = Path(tmp.name)
         try:
             result = import_workbook(db, path)
-            if result["added"]:
+            if result["added"] and prefs.get("auto_sync_on_import"):
                 enricher.start()  # fetch covers and details for the new albums in the background
             return result
         finally:
@@ -319,6 +324,32 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
     @app.post("/api/vibe")
     def vibe(body: VibeBody):
         return library.vibe(body.mood, body.energy, body.time_budget, body.familiarity, seed=body.seed)
+
+    @app.get("/api/settings")
+    async def get_settings():
+        changers = []
+        for c in settings.changers:
+            d = drivers.get(c.id)
+            try:
+                st = await d.status() if d else None
+                state = st.state if st else "missing"
+            except Exception as exc:  # noqa: BLE001 - shown to the user, never fatal
+                state = f"unreachable ({type(exc).__name__})"
+            changers.append({"id": c.id, "name": c.name, "driver": c.driver, "host": c.host,
+                             "port": c.port, "state": state})
+        return {
+            "prefs": prefs.all(),
+            "version": __version__,
+            "configured_listen_script": settings.listen_script or "",
+            "changers": changers,
+        }
+
+    @app.put("/api/settings")
+    def put_settings(body: dict):
+        try:
+            return {"prefs": prefs.update(body)}
+        except PrefsError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/storage")
     def storage():

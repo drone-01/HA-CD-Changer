@@ -73,3 +73,30 @@ def test_storage(tmp_path, drivers, workbook):
     assert s["total_bytes"] >= s["database_bytes"] + s["covers_bytes"]
     assert s["records"]["albums"] >= 0 and "tracks" in s["records"]
     assert s["disk"] is None or s["disk"]["free"] > 0
+
+
+def test_settings(tmp_path, drivers, workbook):
+    with make_client(tmp_path, drivers) as c:
+        s = c.get("/api/settings").json()
+        assert s["prefs"]["full_listen_percent"] == 90 and s["prefs"]["apple_covers"] is True
+        assert [ch["name"] for ch in s["changers"]] == ["Changer 1", "Changer 2"]
+        assert s["version"]
+        r = c.put("/api/settings", json={"full_listen_percent": 75, "apple_covers": False,
+                                          "listen_script": "script.theater_listen"})
+        assert r.status_code == 200 and r.json()["prefs"]["full_listen_percent"] == 75
+        assert c.get("/api/settings").json()["prefs"]["listen_script"] == "script.theater_listen"
+        assert c.put("/api/settings", json={"full_listen_percent": 20}).status_code == 400
+        assert c.put("/api/settings", json={"listen_script": "light.kitchen"}).status_code == 400
+        assert c.put("/api/settings", json={"nope": 1}).status_code == 400
+        # turning off auto-sync keeps an import from starting a lookup
+        c.put("/api/settings", json={"auto_sync_on_import": False})
+        c.post("/api/import", files={"file": ("CD_Collection.xlsx", workbook.read_bytes())})
+        assert c.get("/api/enrich").json()["job"]["running"] is False
+
+
+def test_version_matches_config():
+    from pathlib import Path
+    import re
+    from app import __version__
+    cfg = (Path(__file__).resolve().parent.parent / "config.yaml").read_text()
+    assert re.search(r'^version: "([^"]+)"', cfg, re.M).group(1) == __version__

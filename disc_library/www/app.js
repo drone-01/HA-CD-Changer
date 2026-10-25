@@ -74,7 +74,7 @@
   }
 
   // --- routing -----------------------------------------------------------------
-  const routes = { library: renderLibrary, vibe: renderVibe, playing: renderPlaying, stats: renderStats, pressings: () => renderPressings() };
+  const routes = { library: renderLibrary, vibe: renderVibe, playing: renderPlaying, stats: renderStats, settings: renderSettings, pressings: () => renderPressings() };
   function route() {
     const name = (location.hash || "#library").slice(1);
     const fn = routes[name] || renderLibrary;
@@ -271,7 +271,7 @@
     try {
       const r = await api("import", { method: "POST", body });
       toast(`Imported ${r.rows} rows: ${r.added} new, ${r.updated} updated${r.added ? ". Fetching covers now." : ""}`);
-      renderLibrary();
+      route();
     } catch (err) { toast(err.message); }
   }
 
@@ -738,9 +738,105 @@
         <div class="genre-row"><span class="ellipsis">${esc(g.genre)}</span><div class="bar"><span style="width:${(g.full_listens / maxG) * 100}%"></span></div><span class="quiet" style="text-align:right">${g.full_listens}</span></div>`).join("")}</div>` : ""}
       ${s.most_played.length ? `<h2>Most played</h2><div>${s.most_played.map((m, i) => `
         <div class="list-row" style="font-size:14px"><span class="quiet" style="width:18px">${i + 1}</span>
-          <span class="grow ellipsis">${esc(m.title)} <span class="quiet">· ${esc(m.artist)}</span></span><span class="quiet">${m.plays} play${m.plays === 1 ? "" : "s"}</span></div>`).join("")}</div>` : ""}
-      <h2>Storage</h2><div id="storage"><div class="empty">Loading…</div></div>`;
+          <span class="grow ellipsis">${esc(m.title)} <span class="quiet">· ${esc(m.artist)}</span></span><span class="quiet">${m.plays} play${m.plays === 1 ? "" : "s"}</span></div>`).join("")}</div>` : ""}`;
     view.querySelectorAll("[data-resume]").forEach((b) => (b.onclick = () => resume(Number(b.dataset.resume))));
+  }
+
+  // --- Settings ------------------------------------------------------------------
+  const SYNC_WORDS = { matched: "matched", manual: "locked by hand", pending: "waiting", not_found: "not found",
+    error: "failed", skipped: "skipped" };
+
+  async function renderSettings() {
+    view.innerHTML = `<h1>Settings</h1><div id="settings-body"><div class="empty">Loading…</div></div>`;
+    let s, en;
+    try { [s, en] = await Promise.all([api("settings"), api("enrich")]); }
+    catch (err) { return toast(err.message); }
+    const p = s.prefs;
+    const sw = (key, on) => `<label class="switch"><input type="checkbox" data-pref="${key}" ${on ? "checked" : ""}><span></span></label>`;
+    const counts = en.counts || {};
+    const failed = (counts.error || 0) + (counts.not_found || 0);
+    const job = en.job || {};
+    $("#settings-body").outerHTML = `
+      <h2>Listening</h2>
+      <div class="set-group">
+        <div class="set-row stack">
+          <div style="display:flex;align-items:center;gap:12px">
+            <div class="grow"><div class="label">Full listen</div>
+              <div class="help">How much of an album you need to hear in one sitting for it to count in Stats.</div></div>
+            <span class="pct" id="pct">${p.full_listen_percent}%</span>
+          </div>
+          <input type="range" min="50" max="100" step="5" value="${p.full_listen_percent}" id="full-pct" aria-label="Full listen percentage">
+        </div>
+        <div class="set-row stack">
+          <div><div class="label">Theater script</div>
+            <div class="help">The Home Assistant script that turns on the receiver and TV before an album plays.${s.configured_listen_script ? ` Leave empty to use ${esc(s.configured_listen_script)} from the app configuration.` : " Leave empty to skip it."}</div></div>
+          <form id="script-form" style="display:flex;gap:8px">
+            <input type="text" id="script" value="${esc(p.listen_script)}" placeholder="script.theater_listen" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <button class="btn" type="submit">Save</button>
+          </form>
+        </div>
+      </div>
+
+      <h2>Album info</h2>
+      <div class="set-group">
+        <div class="set-row"><div class="grow"><div class="label">Apple Music covers</div>
+          <div class="help">Use Apple Music artwork when the Cover Art Archive doesn't have a cover or can't be reached.</div></div>${sw("apple_covers", p.apple_covers)}</div>
+        <div class="set-row"><div class="grow"><div class="label">Look up new albums after import</div>
+          <div class="help">Fetch covers, tracks and pressing details as soon as new albums arrive from the spreadsheet.</div></div>${sw("auto_sync_on_import", p.auto_sync_on_import)}</div>
+        <div class="set-row stack">
+          <div><div class="label">Album lookup</div>
+            <div class="help" id="sync-line">${job.running
+              ? `Running: ${job.done} of ${job.total}${job.current ? ` · ${esc(job.current)}` : ""}`
+              : Object.entries(counts).map(([k, v]) => `${v} ${SYNC_WORDS[k] || k}`).join(" · ") || "Nothing looked up yet."}${job.stopped_reason ? `<br>${esc(job.stopped_reason)}` : ""}</div></div>
+          <div class="set-actions">
+            ${job.running ? `<button class="btn" type="button" id="sync-stop">Stop</button>`
+              : `<button class="btn primary" type="button" id="sync-go">Look up waiting albums</button>
+                 ${failed ? `<button class="btn" type="button" id="sync-retry">Retry ${failed} failed</button>` : ""}`}
+            <a class="btn ghost" href="#pressings">Verify pressings</a>
+          </div>
+        </div>
+      </div>
+
+      <h2>Catalog</h2>
+      <div class="set-group">
+        <div class="set-row"><div class="grow"><div class="label">Import spreadsheet</div>
+          <div class="help">Adds new albums and updates catalog details. Locations, favorites, history and locked pressings are kept.</div></div>
+          <label class="btn">${ICONS.upload}Import<input type="file" id="set-import" accept=".xlsx,.xlsm" class="sr-only"></label></div>
+        <div class="set-row"><div class="grow"><div class="label">Export pressings</div>
+          <div class="help">An Excel file with verified catalog numbers, barcodes and matched releases.</div></div>
+          <a class="btn" href="api/pressings/export" download>Export</a></div>
+      </div>
+
+      <h2>Changers</h2>
+      <div class="set-group">
+        ${s.changers.map((c) => `<div class="set-row"><div class="grow"><div class="label">${esc(c.name)}</div>
+          <div class="help">${c.driver === "simulated" ? "Simulated (for testing until the changer is networked)" : `Sony CX7000ES${c.host ? ` at ${esc(c.host)}${c.port ? `:${c.port}` : ""}` : ", no address set"}`}</div></div>
+          <span class="badge ${/^unreachable|missing/.test(c.state) ? "warn" : "good"}">${esc(c.state)}</span></div>`).join("")
+          || `<div class="set-row"><div class="help">No changers set up.</div></div>`}
+        <div class="set-row"><div class="help">Changer names and addresses are set in Home Assistant under Settings → Apps → Disc Library → Configuration, and take effect when the app restarts.</div></div>
+      </div>
+
+      <h2>Storage</h2><div id="storage"><div class="empty">Loading…</div></div>
+
+      <h2>About</h2>
+      <div class="set-group">
+        <div class="set-row"><div class="grow"><div class="label">Disc Library</div><div class="help">Version ${esc(s.version)}</div></div>
+          <a class="btn ghost" href="https://github.com/drone-01/HA-CD-Changer" target="_blank" rel="noopener">GitHub</a></div>
+      </div>`;
+
+    const save = async (changes, msg) => {
+      try { await api("settings", { method: "PUT", json: changes }); if (msg) toast(msg); }
+      catch (err) { toast(err.message); renderSettings(); }
+    };
+    const pct = $("#full-pct");
+    pct.oninput = () => { $("#pct").textContent = `${pct.value}%`; };
+    pct.onchange = () => save({ full_listen_percent: Number(pct.value) }, `Full listen is now ${pct.value}%`);
+    $("#script-form").onsubmit = (e) => { e.preventDefault(); save({ listen_script: $("#script").value.trim() }, "Theater script saved"); };
+    view.querySelectorAll("[data-pref]").forEach((el) => (el.onchange = () => save({ [el.dataset.pref]: el.checked })));
+    if ($("#sync-go")) $("#sync-go").onclick = async () => { await api("enrich/start", { method: "POST" }); renderSettings(); };
+    if ($("#sync-retry")) $("#sync-retry").onclick = async () => { await api("enrich/start?retry=true", { method: "POST" }); renderSettings(); };
+    if ($("#sync-stop")) $("#sync-stop").onclick = async () => { await api("enrich/stop", { method: "POST" }); renderSettings(); };
+    $("#set-import").addEventListener("change", importCatalog);
     renderStorage();
   }
 
