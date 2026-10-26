@@ -30,6 +30,7 @@ CONDITIONS = ["Mint (M)", "Near Mint (NM or M-)", "Very Good Plus (VG+)", "Very 
 DEFAULT_CONDITION = "Very Good (VG)"
 REFRESH_DAYS = 30
 NETWORK_STRIKES = 3
+MIN_LISTINGS = 3          # fewer copies for sale than this: the price is shown but flagged and left out of totals
 
 
 class DiscogsAuthError(Exception):
@@ -108,9 +109,13 @@ class Discogs:
             refused = True
         r = await self._get(f"/marketplace/stats/{release_id}", {"curr_abbr": "USD"})
         if r.status_code == 200:
-            low = (r.json() or {}).get("lowest_price") or {}
+            j = r.json() or {}
+            low = j.get("lowest_price") or {}
+            n = j.get("num_for_sale") or 0
             if low.get("value") is not None:
-                return round(float(low["value"]), 2), "lowest listing", refused
+                # One or two listings say little about value (a lone sealed copy can be listed at anything).
+                basis = f"lowest of {n} listed" if n >= MIN_LISTINGS else f"only {n} listed"
+                return round(float(low["value"]), 2), basis, refused
         return None, "no price on Discogs", refused
 
 
@@ -166,11 +171,14 @@ class ValueUpdater:
     def counts(self) -> dict:
         r = self.db.one(
             """SELECT SUM(value IS NOT NULL AND value_source = 'discogs') AS discogs,
+                      SUM(value_source = 'discogs' AND (value_basis LIKE 'lowest%' OR value_basis LIKE 'only%')) AS listings,
+                      SUM(value_source = 'discogs' AND value_basis LIKE 'only%') AS thin,
                       SUM(value_source = 'manual') AS manual,
                       SUM(value IS NULL AND value_basis = 'not found') AS not_found,
                       MAX(CASE WHEN value_source = 'discogs' THEN value_at END) AS last
                FROM albums WHERE status = 'owned' AND removed_at IS NULL""")
         return {"discogs": r["discogs"] or 0, "manual": r["manual"] or 0, "not_found": r["not_found"] or 0,
+                "from_listings": r["listings"] or 0, "thin": r["thin"] or 0,
                 "last_updated": r["last"], "due": self.due()}
 
     def start(self, force: bool = False, album_ids: list[int] | None = None) -> ValueJob:

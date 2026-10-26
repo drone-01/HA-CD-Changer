@@ -788,7 +788,8 @@
         <button type="button" class="btn ghost" id="dg-off" style="min-height:36px">Disconnect</button></div>
       <div class="set-row stack"><div><div class="label">Prices</div><div class="help" id="dg-status">${status}</div>
           ${j.stopped_reason ? `<div class="form-error">${esc(j.stopped_reason)}</div>` : ""}
-          ${j.notice ? `<div class="help" style="color:var(--accent)">${esc(j.notice)}</div>` : ""}</div>
+          ${j.notice || (c.from_listings && c.from_listings >= c.discogs) ? `<div class="help" style="color:var(--accent)">Discogs is giving lowest listings, not VG prices. In Discogs → Settings → Seller Settings, set your currency (that's enough), then tap Update all prices.</div>` : ""}
+          ${c.thin ? `<div class="help">${c.thin} price${c.thin === 1 ? "" : "s"} rest on only one or two listings; they show on the album but are left out of totals.</div>` : ""}</div>
         <div class="set-actions">${j.running ? `<button type="button" class="btn" id="dg-stop">Stop</button>`
           : `<button type="button" class="btn primary" id="dg-go">${c.due ? `Price ${c.due} albums` : "Update all prices"}</button>`}</div></div>
       <details class="set-row" style="display:block"><summary class="help" style="cursor:pointer;min-height:28px">Condition: ${esc(p.discogs_condition)}</summary>
@@ -814,7 +815,8 @@
       <div class="row"><h2 class="grow">Value</h2>${a.value != null ? `<span class="tier">${tierOf(a.value)}</span>` : ""}
         <button type="button" class="btn ghost" id="money-edit" style="min-height:32px;font-size:13px;padding:0 10px">Edit</button></div>
       <div class="money">
-        <div><div class="amt">${a.value != null ? money(a.value) : "—"}</div><div class="src">Market value · ${valueSrc}</div></div>
+        <div><div class="amt">${a.value != null ? money(a.value) : "—"}</div><div class="src">Market value · ${valueSrc}</div>
+          ${(a.value_basis || "").startsWith("only ") ? `<div class="src" style="color:var(--accent)">Too few copies for sale to trust; left out of totals.</div>` : ""}</div>
         <div><div class="amt">${a.paid != null ? money(a.paid) : "—"}</div><div class="src">You paid · ${paidSrc}</div></div>
       </div>
       ${perListen ? `<div class="quiet" style="font-size:13px">${perListen} per full listen so far</div>` : ""}
@@ -1449,7 +1451,7 @@
 
       <h2>Money</h2>
       <div class="kpis">
-        ${kpi("Collection value", m.value_known ? money(Math.round(m.value_total)) : "—", m.value_known ? `${m.value_known} of ${c.albums} priced` : "Waiting on Discogs prices")}
+        ${kpi("Collection value", m.value_known ? money(Math.round(m.value_total)) : "—", m.value_known ? `${m.value_known} of ${c.albums} priced${m.value_thin ? ` · ${m.value_thin} left out (too few listings)` : ""}` : "Waiting on Discogs prices")}
         ${kpi("You paid", m.paid_known ? money(Math.round(m.paid_total)) : "—", m.paid_known ? `known for ${m.paid_known} of ${c.albums}` : "")}
         ${kpi("Average value", m.value_avg != null ? money(m.value_avg) : "—")}
         ${kpi("Cost per listen", m.cost_per_listen != null ? money(m.cost_per_listen) : "—", "what you paid ÷ full listens")}

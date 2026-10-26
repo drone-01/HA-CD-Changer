@@ -61,7 +61,7 @@ def test_prices_by_catalog_then_title(db, workbook):
     dirt = db.one("SELECT * FROM albums WHERE title = 'Dirt'")
     assert (dirt["discogs_release"], dirt["value"], dirt["value_source"], dirt["value_basis"]) == ("11", 6.43, "discogs", "VG")
     nev = db.one("SELECT * FROM albums WHERE title = 'Nevermind'")
-    assert (nev["value"], nev["value_basis"]) == (3.5, "lowest listing")  # no suggestion -> lowest listing
+    assert (nev["value"], nev["value_basis"]) == (3.5, "lowest of 4 listed")  # no suggestion -> lowest listing
     tds = db.one("SELECT * FROM albums WHERE title = 'The Downward Spiral'")
     assert tds["value"] is None and tds["value_basis"] == "not found"
     # on-order albums are not priced
@@ -88,7 +88,7 @@ def test_lowest_listing_when_suggestions_refused(db, workbook):
         vu.start()
         await vu.wait()
     run(go())
-    assert db.one("SELECT value, value_basis FROM albums WHERE title = 'Dirt'") == {"value": 3.5, "value_basis": "lowest listing"}
+    assert db.one("SELECT value, value_basis FROM albums WHERE title = 'Dirt'") == {"value": 3.5, "value_basis": "lowest of 4 listed"}
     assert "seller settings" in vu.state.notice
 
 
@@ -97,3 +97,11 @@ def test_token_never_sent_to_browser(db):
     prefs.update({"discogs_token": "secret"})
     pub = prefs.public()
     assert "discogs_token" not in pub and pub["has_discogs_token"] is True
+
+
+def test_thin_listings_are_flagged_and_left_out(db, workbook):
+    import_workbook(db, workbook)
+    db.execute("UPDATE albums SET value = 3200, value_source = 'discogs', value_basis = 'only 1 listed' WHERE title = 'Dirt'")
+    db.execute("UPDATE albums SET value = 8, value_source = 'discogs', value_basis = 'VG' WHERE title = 'Nevermind'")
+    c = Library(db, [1]).collection()
+    assert c["money"]["value_total"] == 8 and c["money"]["value_thin"] == 1

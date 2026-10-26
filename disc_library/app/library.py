@@ -334,7 +334,7 @@ class Library:
     # --- collection --------------------------------------------------------------
     def collection(self, changer_names: dict[int, str] | None = None) -> dict:
         albums = self.db.query(
-            """SELECT a.id, a.artist, a.title, a.format, a.media_kind, a.status, a.runtime_sec, a.paid, a.value,
+            """SELECT a.id, a.artist, a.title, a.format, a.media_kind, a.status, a.runtime_sec, a.paid, a.value, a.value_basis,
                       a.art_url, (SELECT COUNT(*) FROM sessions s WHERE s.album_id = a.id AND s.completed = 1) AS full_listens,
                       (SELECT COUNT(*) FROM discs d WHERE d.album_id = a.id) AS discs
                FROM albums a WHERE a.removed_at IS NULL""")
@@ -352,7 +352,9 @@ class Library:
         audio = [a for a in owned if a["media_kind"] == "audio"]
         timed = [a for a in audio if a["runtime_sec"]]
         paid = [a for a in owned if a["paid"] is not None]
-        valued = [a for a in owned if a["value"] is not None]
+        # Prices backed by only one or two listings are shown on the album but kept out of totals.
+        valued = [a for a in owned if a["value"] is not None and not (a["value_basis"] or "").startswith("only ")]
+        thin = sum(1 for a in owned if (a["value_basis"] or "").startswith("only "))
         tiers = {"$": 0, "$$": 0, "$$$": 0}
         for a in valued:
             tiers[value_tier(a["value"])] += 1
@@ -375,6 +377,7 @@ class Library:
                 "paid_known": len(paid),
                 "value_total": round(sum(a["value"] for a in valued), 2),
                 "value_known": len(valued),
+                "value_thin": thin,
                 "value_avg": round(sum(a["value"] for a in valued) / len(valued), 2) if valued else None,
                 "tiers": tiers,
                 "cost_per_listen": round(sum(a["paid"] for a in played_paid) / listens, 2) if listens else None,
