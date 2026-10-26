@@ -4,7 +4,7 @@ An album-first app for browsing and playing a physical disc collection across
 two Sony BDP-CX7000ES 400-disc changers. It runs as a Home Assistant add-on
 with its own sidebar panel, designed for the iPhone first.
 
-## What works today (v0.4.0)
+## What works today (v0.5.0)
 
 | Area | Status |
 | --- | --- |
@@ -89,6 +89,22 @@ request a second). Covers are saved in the add-on's data folder, so the grid sta
 - Anything uncertain is left unmatched rather than guessed.
 - If the Cover Art Archive can't be reached, covers come from Apple Music instead (matched on artist
   and album). The job stops itself with a message if MusicBrainz can't be reached at all.
+
+## Value and collection stats
+
+- Each album shows its market value and what you paid. Paid prices are read from the eBay notes in
+  the spreadsheet ("bought for $X", or the order total); both can be typed in on the album.
+  Discogs market prices are next.
+- Value tiers: $ under $9, $$ $9–24, $$$ $25 and up. Marks on library covers are off by default
+  (Settings → Value). The library can be sorted by value.
+- Stats → Collection: albums, discs, formats, changer slots used and free, discs not in a changer,
+  total play time, collection value, paid, average value, cost per listen, most valuable.
+
+## Removing albums
+
+Remove an album from the bottom of its page. You confirm first, its slot is freed, and an Undo
+appears for a few seconds. Re-importing the spreadsheet won't bring it back; restore it from
+Settings → Removed albums (it goes back into its old slot if that slot is still free).
 
 ## Settings
 

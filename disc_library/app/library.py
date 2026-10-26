@@ -16,7 +16,36 @@ SORTS = {
     "year": "a.year DESC, a.artist COLLATE NOCASE",
     "added": "a.created_at DESC, a.id DESC",
     "played": "last_played DESC NULLS LAST, a.artist COLLATE NOCASE",
+    "value": "a.value DESC NULLS LAST, a.paid DESC NULLS LAST, a.artist COLLATE NOCASE",
 }
+
+VALUE_TIERS = ((9, "$"), (25, "$$"))  # under $9, $9-24.99, $25 and up
+
+
+def value_tier(value: float | None) -> str | None:
+    if value is None:
+        return None
+    for limit, mark in VALUE_TIERS:
+        if value < limit:
+            return mark
+    return "$$$"
+
+
+def format_group(fmt: str | None, media_kind: str) -> str:
+    f = (fmt or "").lower()
+    if media_kind == "video":
+        return "Blu-ray" if "blu" in f else "DVD" if "dvd" in f else "Video"
+    if "blu" in f:
+        return "Blu-ray Audio"
+    if "sacd" in f:
+        return "SACD"
+    if "dvd" in f:
+        return "DVD-Audio"
+    return "CD"
+
+
+class RemoveError(ValueError):
+    pass
 
 ALBUM_SELECT = """
 SELECT a.*, d.id AS disc_id, d.location_type, d.changer_id, d.slot, d.location_note,
@@ -40,7 +69,7 @@ class Library:
     def albums(self, q: str | None = None, genre: str | None = None, favorites: bool = False,
                media_kind: str | None = "audio", status: str | None = "owned", sort: str = "artist",
                limit: int = 1000, offset: int = 0) -> list[dict]:
-        where, params = [], []
+        where, params = ["a.removed_at IS NULL"], []
         if q:
             where.append("""(a.artist LIKE ? OR a.title LIKE ? OR a.label LIKE ?
                              OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND t.title LIKE ?))""")
@@ -79,7 +108,7 @@ class Library:
     def genres(self) -> list[dict]:
         return self.db.query(
             """SELECT genre AS name, COUNT(*) AS albums FROM albums
-               WHERE genre IS NOT NULL AND media_kind = 'audio' AND status = 'owned'
+               WHERE genre IS NOT NULL AND media_kind = 'audio' AND status = 'owned' AND removed_at IS NULL
                GROUP BY genre ORDER BY albums DESC"""
         )
 
@@ -138,11 +167,131 @@ class Library:
             for cid in self.changer_ids
         ]
 
+    # --- removing ----------------------------------------------------------------
+    def remove_preview(self, album_id: int) -> dict:
+        a = self.db.one("SELECT id, artist, title, removed_at FROM albums WHERE id = ?", (album_id,))
+        if not a:
+            raise RemoveError("Album not found.")
+        discs = self.db.query("SELECT disc_number, location_type, changer_id, slot FROM discs WHERE album_id = ?", (album_id,))
+        listens = self.db.one("SELECT COUNT(*) AS n FROM sessions WHERE album_id = ?", (album_id,))["n"]
+        return {**a, "discs": discs, "listens": listens,
+                "slots": [d for d in discs if d["location_type"] == "changer"]}
+
+    def remove(self, album_id: int) -> dict:
+        info = self.remove_preview(album_id)
+        if info["removed_at"]:
+            return info
+        with self.db.connect() as con:
+            con.execute("""UPDATE discs SET prev_changer_id = changer_id, prev_slot = slot,
+                           location_type = CASE WHEN location_type = 'changer' THEN 'unassigned' ELSE location_type END,
+                           changer_id = NULL, slot = NULL WHERE album_id = ?""", (album_id,))
+            con.execute("UPDATE albums SET removed_at = datetime('now') WHERE id = ?", (album_id,))
+        return self.remove_preview(album_id)
+
+    def restore(self, album_id: int) -> dict:
+        """Bring a removed album back, into its old slot when that slot is still free."""
+        a = self.db.one("SELECT id, removed_at FROM albums WHERE id = ?", (album_id,))
+        if not a:
+            raise RemoveError("Album not found.")
+        back = []
+        with self.db.connect() as con:
+            con.execute("UPDATE albums SET removed_at = NULL WHERE id = ?", (album_id,))
+            for d in con.execute("SELECT * FROM discs WHERE album_id = ?", (album_id,)).fetchall():
+                if d["prev_slot"] and d["prev_changer_id"] in self.changer_ids:
+                    taken = con.execute("SELECT 1 FROM discs WHERE changer_id = ? AND slot = ?",
+                                        (d["prev_changer_id"], d["prev_slot"])).fetchone()
+                    if not taken:
+                        con.execute("""UPDATE discs SET location_type = 'changer', changer_id = ?, slot = ?,
+                                       prev_changer_id = NULL, prev_slot = NULL WHERE id = ?""",
+                                    (d["prev_changer_id"], d["prev_slot"], d["id"]))
+                        back.append({"changer_id": d["prev_changer_id"], "slot": d["prev_slot"]})
+        return {"id": album_id, "back_in_slot": back}
+
+    def removed(self) -> list[dict]:
+        return self.db.query(
+            """SELECT a.id, a.artist, a.title, a.format, a.art_url, a.removed_at FROM albums a
+               WHERE a.removed_at IS NOT NULL ORDER BY a.removed_at DESC""")
+
+    # --- money ---------------------------------------------------------------------
+    def set_money(self, album_id: int, changes: dict) -> dict:
+        for key in ("paid", "value"):
+            if key not in changes:
+                continue
+            v = changes[key]
+            if v in ("", None):
+                v = None
+            else:
+                try:
+                    v = round(float(str(v).replace("$", "").replace(",", "")), 2)
+                except ValueError as exc:
+                    raise ValueError(f"{key.capitalize()} must be a dollar amount.") from exc
+                if v < 0:
+                    raise ValueError(f"{key.capitalize()} can't be negative.")
+            src = "manual" if v is not None else None
+            if key == "paid":
+                self.db.execute("UPDATE albums SET paid = ?, paid_source = ? WHERE id = ?", (v, src, album_id))
+            else:
+                self.db.execute("UPDATE albums SET value = ?, value_source = ?, value_at = datetime('now') WHERE id = ?",
+                                (v, src, album_id))
+        return self.db.one("SELECT paid, paid_source, value, value_source, value_at FROM albums WHERE id = ?", (album_id,))
+
+    # --- collection --------------------------------------------------------------
+    def collection(self, changer_names: dict[int, str] | None = None) -> dict:
+        albums = self.db.query(
+            """SELECT a.id, a.artist, a.title, a.format, a.media_kind, a.status, a.runtime_sec, a.paid, a.value,
+                      a.art_url, (SELECT COUNT(*) FROM sessions s WHERE s.album_id = a.id AND s.completed = 1) AS full_listens,
+                      (SELECT COUNT(*) FROM discs d WHERE d.album_id = a.id) AS discs
+               FROM albums a WHERE a.removed_at IS NULL""")
+        owned = [a for a in albums if a["status"] == "owned"]
+        formats: dict[str, int] = {}
+        for a in owned:
+            g = format_group(a["format"], a["media_kind"])
+            formats[g] = formats.get(g, 0) + 1
+        disc_rows = self.db.query(
+            """SELECT d.location_type, d.changer_id FROM discs d JOIN albums a ON a.id = d.album_id
+               WHERE a.removed_at IS NULL AND a.status = 'owned'""")
+        names = changer_names or {}
+        changers = [{"id": cid, "name": names.get(cid, f"Changer {cid}"), "used": self._used(cid),
+                     "capacity": SLOTS_PER_CHANGER} for cid in self.changer_ids]
+        audio = [a for a in owned if a["media_kind"] == "audio"]
+        timed = [a for a in audio if a["runtime_sec"]]
+        paid = [a for a in owned if a["paid"] is not None]
+        valued = [a for a in owned if a["value"] is not None]
+        tiers = {"$": 0, "$$": 0, "$$$": 0}
+        for a in valued:
+            tiers[value_tier(a["value"])] += 1
+        played_paid = [a for a in paid if a["full_listens"]]
+        listens = sum(a["full_listens"] for a in played_paid)
+        top = sorted(valued, key=lambda a: a["value"], reverse=True)[:10]
+        return {
+            "albums": len(owned),
+            "on_order": sum(1 for a in albums if a["status"] == "on_order"),
+            "discs": len(disc_rows),
+            "audio": len(audio),
+            "video": sum(1 for a in owned if a["media_kind"] == "video"),
+            "formats": dict(sorted(formats.items(), key=lambda kv: -kv[1])),
+            "changers": changers,
+            "not_in_changer": sum(1 for d in disc_rows if d["location_type"] != "changer"),
+            "runtime_sec": sum(a["runtime_sec"] for a in timed),
+            "runtime_known": len(timed),
+            "money": {
+                "paid_total": round(sum(a["paid"] for a in paid), 2),
+                "paid_known": len(paid),
+                "value_total": round(sum(a["value"] for a in valued), 2),
+                "value_known": len(valued),
+                "value_avg": round(sum(a["value"] for a in valued) / len(valued), 2) if valued else None,
+                "tiers": tiers,
+                "cost_per_listen": round(sum(a["paid"] for a in played_paid) / listens, 2) if listens else None,
+                "top": [{"id": a["id"], "artist": a["artist"], "title": a["title"], "value": a["value"],
+                         "paid": a["paid"], "art_url": a["art_url"]} for a in top],
+            },
+        }
+
     # --- history and stats -----------------------------------------------------
     def history(self, limit: int = 50) -> list[dict]:
         return self.db.query(
             """SELECT s.*, a.artist, a.title, a.year FROM sessions s JOIN albums a ON a.id = s.album_id
-               ORDER BY s.started_at DESC, s.id DESC LIMIT ?""",
+               WHERE a.removed_at IS NULL ORDER BY s.started_at DESC, s.id DESC LIMIT ?""",
             (limit,),
         )
 
@@ -152,7 +301,7 @@ class Library:
             """SELECT a.id AS album_id, a.artist, a.title, s.last_track, s.ended_at,
                       (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id AND t.disc_number = 1) AS track_count
                FROM sessions s JOIN albums a ON a.id = s.album_id
-               WHERE s.id = (SELECT id FROM sessions s2 WHERE s2.album_id = s.album_id
+               WHERE a.removed_at IS NULL AND s.id = (SELECT id FROM sessions s2 WHERE s2.album_id = s.album_id
                              ORDER BY s2.started_at DESC, s2.id DESC LIMIT 1)
                  AND s.completed = 0 AND s.ended_at IS NOT NULL AND s.end_reason != 'finished'
                ORDER BY s.ended_at DESC LIMIT ?""",
@@ -161,18 +310,19 @@ class Library:
 
     def stats(self, since: str | None = None) -> dict:
         """since: ISO date (inclusive) or None for all time."""
-        cond, params = ("WHERE s.started_at >= ?", (since,)) if since else ("", ())
+        cond, params = ("WHERE a.removed_at IS NULL AND s.started_at >= ?", (since,)) if since \
+            else ("WHERE a.removed_at IS NULL", ())
         totals = self.db.one(
             f"""SELECT COALESCE(SUM(s.completed), 0) AS full_listens,
                        COALESCE(SUM(CASE WHEN s.ended_at IS NOT NULL AND s.completed = 0 THEN 1 ELSE 0 END), 0)
                            AS partial_listens,
                        COALESCE(SUM(s.played_sec), 0) AS played_sec,
                        COUNT(DISTINCT s.album_id) AS albums_played
-                FROM sessions s {cond}""",
+                FROM sessions s JOIN albums a ON a.id = s.album_id {cond}""",
             params,
         )
         owned = self.db.one(
-            "SELECT COUNT(*) AS n FROM albums WHERE status = 'owned' AND media_kind = 'audio'"
+            "SELECT COUNT(*) AS n FROM albums WHERE status = 'owned' AND media_kind = 'audio' AND removed_at IS NULL"
         )["n"]
         by_genre = self.db.query(
             f"""SELECT COALESCE(a.genre, 'Untagged') AS genre, SUM(s.completed) AS full_listens
@@ -190,7 +340,7 @@ class Library:
             date.fromisoformat(r["d"])
             for r in self.db.query("SELECT DISTINCT date(started_at) AS d FROM sessions ORDER BY d")
         ]
-        current, longest = _streaks(days, date.today())
+        current, longest = _streaks(days, datetime.now(timezone.utc).date())  # session times are stored in UTC
         return {
             "full_listens": totals["full_listens"],
             "partial_listens": totals["partial_listens"],
@@ -214,7 +364,7 @@ class Library:
     }
 
     def pressing_counts(self) -> dict:
-        base = "FROM albums a WHERE a.media_kind = 'audio' AND a.status = 'owned' AND "
+        base = "FROM albums a WHERE a.media_kind = 'audio' AND a.status = 'owned' AND a.removed_at IS NULL AND "
         return {k: self.db.one(f"SELECT COUNT(*) AS n {base} {w}")["n"] for k, w in self.PRESSING_FILTERS.items()}
 
     def pressings(self, which: str = "review", limit: int = 1000) -> list[dict]:
@@ -224,7 +374,7 @@ class Library:
                        a.pressing_locked, a.match_method, a.enrich_status, a.enrich_note, a.art_url,
                        a.rel_label, a.rel_catno, a.rel_barcode, a.rel_country, a.rel_date, a.rel_format,
                        a.rel_track_count, a.mbid_release
-                FROM albums a WHERE a.media_kind = 'audio' AND a.status = 'owned' AND {where}
+                FROM albums a WHERE a.media_kind = 'audio' AND a.status = 'owned' AND a.removed_at IS NULL AND {where}
                 ORDER BY a.artist COLLATE NOCASE, a.year, a.title COLLATE NOCASE LIMIT ?""",
             (limit,),
         )
@@ -247,7 +397,7 @@ class Library:
             c.font = Font(bold=True, color="FFFFFF")
             c.fill = PatternFill("solid", fgColor="FF2C2926")
         rows = self.db.query(
-            """SELECT * FROM albums WHERE media_kind = 'audio' AND status = 'owned'
+            """SELECT * FROM albums WHERE media_kind = 'audio' AND status = 'owned' AND removed_at IS NULL
                ORDER BY artist COLLATE NOCASE, year, title COLLATE NOCASE""")
         for r in rows:
             ws.append([r["artist"], r["title"], r["catalog_no"], r["catalog_verified"], r["barcode"] or r["rel_barcode"],

@@ -354,7 +354,7 @@ class Enricher:
     # --- public ---------------------------------------------------------------------
     def counts(self) -> dict:
         rows = self.db.query(
-            "SELECT enrich_status AS s, COUNT(*) AS n FROM albums WHERE media_kind = 'audio' GROUP BY 1"
+            "SELECT enrich_status AS s, COUNT(*) AS n FROM albums WHERE media_kind = 'audio' AND removed_at IS NULL GROUP BY 1"
         )
         return {r["s"]: r["n"] for r in rows}
 
@@ -363,7 +363,7 @@ class Enricher:
             return self.state
         statuses = ("pending", "not_found", "error") if retry_failed else ("pending",)
         ids = [r["id"] for r in self.db.query(
-            f"""SELECT id FROM albums WHERE media_kind = 'audio' AND pressing_locked = 0
+            f"""SELECT id FROM albums WHERE media_kind = 'audio' AND pressing_locked = 0 AND removed_at IS NULL
                 AND enrich_status IN ({','.join('?' * len(statuses))}) ORDER BY artist, year""",
             statuses,
         )]

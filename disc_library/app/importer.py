@@ -57,6 +57,23 @@ def _clean(value) -> str | None:
     return s or None
 
 
+PRICE_TOTAL = re.compile(r"order total(?: of)?\s*(?:US\s*)?\$\s?(\d[\d,]*(?:\.\d{1,2})?)", re.I)
+PRICE_FOR = re.compile(r"\bfor\s+(?:US\s*)?\$\s?(\d[\d,]*(?:\.\d{1,2})?)", re.I)
+
+
+def paid_from_notes(notes: str | None) -> float | None:
+    """The price in the eBay notes: the order total when given, else the "bought for $X" price."""
+    if not notes:
+        return None
+    m = PRICE_TOTAL.search(notes) or PRICE_FOR.search(notes)
+    if not m:
+        return None
+    try:
+        return round(float(m.group(1).replace(",", "")), 2)
+    except ValueError:
+        return None
+
+
 def import_key(artist: str, title: str, fmt: str, catalog: str | None) -> str:
     norm = lambda s: re.sub(r"\s+", " ", (s or "").strip().lower())
     return "|".join([norm(artist), norm(title), norm(fmt), norm(catalog)])
@@ -99,6 +116,7 @@ def parse_workbook(path: Path | str) -> list[dict]:
                     "label": _clean(rec.get("label")),
                     "edition_notes": _clean(rec.get("notes")),
                     "status": STATUS_MAP.get(status_raw, "owned"),
+                    "paid": paid_from_notes(_clean(rec.get("notes"))),
                     "source_sheet": ws.title,
                 }
             )
@@ -108,13 +126,16 @@ def parse_workbook(path: Path | str) -> list[dict]:
 
 def import_workbook(db: Database, path: Path | str) -> dict:
     rows = parse_workbook(path)
-    added = updated = 0
+    added = updated = removed = 0
     by_sheet: dict[str, int] = {}
     with db.connect() as con:
         for r in rows:
             key = import_key(r["artist"], r["title"], r["format"], r["catalog_no"])
             by_sheet[r["source_sheet"]] = by_sheet.get(r["source_sheet"], 0) + 1
-            existing = con.execute("SELECT id FROM albums WHERE import_key = ?", (key,)).fetchone()
+            existing = con.execute("SELECT id, removed_at FROM albums WHERE import_key = ?", (key,)).fetchone()
+            if existing and existing["removed_at"]:
+                removed += 1  # removed in the app: stays removed until restored there
+                continue
             if existing:
                 con.execute(
                     """UPDATE albums SET artist=?, title=?, year=?, label=?, catalog_no=?, format=?,
@@ -123,15 +144,21 @@ def import_workbook(db: Database, path: Path | str) -> dict:
                     (r["artist"], r["title"], r["year"], r["label"], r["catalog_no"], r["format"],
                      r["media_kind"], r["edition_notes"], r["status"], r["source_sheet"], existing["id"]),
                 )
+                con.execute(
+                    """UPDATE albums SET paid = ?, paid_source = CASE WHEN ? IS NULL THEN NULL ELSE 'notes' END
+                       WHERE id = ? AND COALESCE(paid_source, 'notes') = 'notes'""",
+                    (r["paid"], r["paid"], existing["id"]))
                 updated += 1
             else:
                 cur = con.execute(
                     """INSERT INTO albums (import_key, artist, title, year, label, catalog_no, format,
-                       media_kind, edition_notes, status, source_sheet)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                       media_kind, edition_notes, status, source_sheet, paid, paid_source)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (key, r["artist"], r["title"], r["year"], r["label"], r["catalog_no"], r["format"],
-                     r["media_kind"], r["edition_notes"], r["status"], r["source_sheet"]),
+                     r["media_kind"], r["edition_notes"], r["status"], r["source_sheet"],
+                     r["paid"], "notes" if r["paid"] is not None else None),
                 )
                 con.execute("INSERT INTO discs (album_id, disc_number) VALUES (?, 1)", (cur.lastrowid,))
                 added += 1
-    return {"rows": len(rows), "added": added, "updated": updated, "by_sheet": by_sheet}
+    return {"rows": len(rows), "added": added, "updated": updated, "skipped_removed": removed,
+            "by_sheet": by_sheet}

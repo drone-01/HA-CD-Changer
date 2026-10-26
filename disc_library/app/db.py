@@ -103,6 +103,18 @@ MIGRATIONS = {
         "rel_format": "TEXT",
         "rel_track_count": "INTEGER",
         "art_source": "TEXT",                   # caa | apple
+        # removing and money (v0.5.0)
+        "removed_at": "TEXT",                   # set when removed in the app; re-imports leave it removed
+        "paid": "REAL",                         # what was paid, from the spreadsheet notes or typed in
+        "paid_source": "TEXT",                  # notes | manual
+        "value": "REAL",                        # market value (Discogs, or typed in)
+        "value_source": "TEXT",                 # discogs | manual
+        "value_at": "TEXT",
+        "discogs_release": "TEXT",
+    },
+    "discs": {
+        "prev_changer_id": "INTEGER",           # where the disc was before it was removed or loaned
+        "prev_slot": "INTEGER",
     },
 }
 

@@ -100,3 +100,19 @@ def test_version_matches_config():
     from app import __version__
     cfg = (Path(__file__).resolve().parent.parent / "config.yaml").read_text()
     assert re.search(r'^version: "([^"]+)"', cfg, re.M).group(1) == __version__
+
+
+def test_remove_and_money_api(tmp_path, drivers, workbook):
+    with make_client(tmp_path, drivers) as c:
+        c.post("/api/import", files={"file": ("CD_Collection.xlsx", workbook.read_bytes())})
+        dirt = next(a for a in c.get("/api/albums").json() if a["title"] == "Dirt")
+        assert c.get(f"/api/albums/{dirt['id']}/remove-preview").json()["title"] == "Dirt"
+        assert c.put(f"/api/albums/{dirt['id']}/money", json={"value": "abc"}).status_code == 400
+        assert c.put(f"/api/albums/{dirt['id']}/money", json={"value": 12, "paid": 7}).json()["value"] == 12
+        assert c.get("/api/collection").json()["money"]["tiers"]["$$"] == 1
+        assert c.delete(f"/api/albums/{dirt['id']}").status_code == 200
+        assert "Dirt" not in [a["title"] for a in c.get("/api/albums").json()]
+        assert [r["title"] for r in c.get("/api/removed").json()] == ["Dirt"]
+        assert c.post(f"/api/albums/{dirt['id']}/restore").status_code == 200
+        assert "Dirt" in [a["title"] for a in c.get("/api/albums").json()]
+        assert c.delete("/api/albums/99999").status_code == 404

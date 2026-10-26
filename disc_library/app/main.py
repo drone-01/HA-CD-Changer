@@ -30,7 +30,7 @@ from .enrich import Enricher
 from .ha_client import HAClient
 from .importer import import_workbook
 from .prefs import Prefs, PrefsError
-from .library import Library, LocationError
+from .library import Library, LocationError, RemoveError
 from .player import PlayError, Player
 
 log = logging.getLogger("disc_library")
@@ -218,6 +218,46 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
             raise HTTPException(404, "Album not found")
         return a
 
+    @app.get("/api/albums/{album_id}/remove-preview")
+    def remove_preview(album_id: int):
+        try:
+            return library.remove_preview(album_id)
+        except RemoveError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.delete("/api/albums/{album_id}")
+    def remove_album(album_id: int):
+        if player.active and player.active.album_id == album_id:
+            raise HTTPException(409, "This album is playing. Stop it first.")
+        try:
+            return library.remove(album_id)
+        except RemoveError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/albums/{album_id}/restore")
+    def restore_album(album_id: int):
+        try:
+            return library.restore(album_id)
+        except RemoveError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/removed")
+    def removed_albums():
+        return library.removed()
+
+    @app.put("/api/albums/{album_id}/money")
+    def set_money(album_id: int, body: dict):
+        if not library.album(album_id):
+            raise HTTPException(404, "Album not found")
+        try:
+            return library.set_money(album_id, body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/collection")
+    def collection():
+        return library.collection({c.id: c.name for c in settings.changers})
+
     @app.post("/api/albums/{album_id}/favorite")
     def favorite(album_id: int, body: FavoriteBody):
         library.set_favorite(album_id, body.favorite)
@@ -343,6 +383,10 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
             "configured_listen_script": settings.listen_script or "",
             "changers": changers,
         }
+
+    @app.get("/api/prefs")
+    def get_prefs():
+        return prefs.all()
 
     @app.put("/api/settings")
     def put_settings(body: dict):

@@ -13,6 +13,7 @@ DEFAULTS: dict[str, object] = {
     "listen_script": "",            # HA script run before playing; empty = use the app configuration
     "apple_covers": True,           # fall back to Apple Music artwork when the Cover Art Archive has none
     "auto_sync_on_import": True,    # look up new albums right after a spreadsheet import
+    "show_value_marks": False,      # $ / $$ / $$$ on library covers
 }
 
 

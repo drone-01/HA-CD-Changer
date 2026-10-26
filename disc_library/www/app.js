@@ -21,7 +21,7 @@
   const ART_COLORS = ["#5A4E3B", "#4A4A3B", "#3B4A5A", "#5A3B4D", "#3B5A55", "#5A3B3B", "#3F3B5A", "#4D5A3B"];
 
   const state = {
-    q: "", filter: "all", sort: "artist", albums: [], genres: [], changers: [],
+    q: "", filter: "all", sort: "artist", albums: [], genres: [], changers: [], prefs: {},
     vibe: { mood: "Brooding", energy: "High", time_budget: "about_hour", familiarity: "rediscover" },
     vibePicks: null, statsRange: "year", now: { playing: false },
   };
@@ -43,13 +43,23 @@
   }
 
   let toastTimer;
-  function toast(msg) {
+  function toast(msg, action) {
     const t = $("#toast");
     t.textContent = msg;
+    t.classList.toggle("action", !!action);
+    if (action) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = action.label;
+      b.onclick = () => { t.classList.remove("show"); action.run(); };
+      t.appendChild(b);
+    }
     t.classList.add("show");
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => t.classList.remove("show"), 3200);
+    toastTimer = setTimeout(() => t.classList.remove("show"), action ? 8000 : 3200);
   }
+  const money = (v) => v == null ? "" : `$${Number(v).toFixed(2).replace(/\.00$/, "")}`;
+  const tierOf = (v) => v == null ? "" : v < 9 ? "$" : v < 25 ? "$$" : "$$$";
 
   function art(album, size = "") {
     const id = album.id ?? album.album_id ?? 0;
@@ -115,7 +125,7 @@
         <label class="sr-only" for="sort">Sort</label>
         <select id="sort" class="btn ghost" style="min-height:36px;padding:0 10px;font-size:14px">
           <option value="artist">Artist A–Z</option><option value="title">Title</option>
-          <option value="year">Newest</option><option value="added">Recently added</option><option value="played">Last played</option>
+          <option value="year">Newest</option><option value="added">Recently added</option><option value="played">Last played</option><option value="value">Value</option>
         </select>
       </div>
       <div class="grid" id="grid"></div>
@@ -136,7 +146,7 @@
     });
 
     try {
-      [state.genres, state.changers] = await Promise.all([api("genres"), api("changers")]);
+      [state.genres, state.changers, state.prefs] = await Promise.all([api("genres"), api("changers"), api("prefs").catch(() => ({}))]);
       await loadAlbums();
     } catch (err) { toast(err.message); }
     drawChips();
@@ -253,7 +263,7 @@
     }
     grid.innerHTML = state.albums.map((a) => `
       <button type="button" class="tile" data-id="${a.id}" aria-label="${esc(a.title)} by ${esc(a.artist)}">
-        <div style="position:relative">${art(a)}${where(a) ? `<span class="where" aria-hidden="true">${where(a)}</span>` : ""}</div>
+        <div style="position:relative">${art(a)}${where(a) ? `<span class="where" aria-hidden="true">${where(a)}</span>` : ""}${state.prefs.show_value_marks && a.value != null ? `<span class="vmark" aria-hidden="true">${tierOf(a.value)}</span>` : ""}</div>
         <span class="t ellipsis">${esc(a.title)}</span>
         <span class="a ellipsis">${esc(a.artist)}</span>
       </button>`).join("");
@@ -317,6 +327,7 @@
             ${ICONS.heart.replace("<svg", `<svg style="${a.favorite ? "fill:var(--accent);stroke:var(--accent)" : ""}"`)}</button>
         </div>
         ${a.tracks.length ? `<ol class="tracklist">${a.tracks.map((t) => `<li><span class="n">${t.number}</span><span class="grow ellipsis">${esc(t.title || "")}</span><span class="quiet" style="font-size:13px">${fmtLen(t.duration_sec)}</span></li>`).join("")}</ol>` : ""}
+        ${moneyCard(a)}
         ${pressingCard(a, statusText)}
         <form id="loc" class="card" style="display:flex;flex-direction:column;gap:10px">
           <h2>Where is this disc?</h2>
@@ -339,6 +350,8 @@
             <button type="submit" class="btn grow">Save location</button>
           </div>
         </form>
+        ${loanPreview()}
+        <div id="remove-box"><button type="button" class="btn danger block" id="remove">Remove from library</button></div>
       </div>`;
     const disc = a.discs[0];
     $("#loc-type").value = a.location_type || "unassigned";
@@ -374,6 +387,8 @@
       } catch (err) { $("#loc-err").textContent = err.message; }
     };
     bindPressingCard(a);
+    bindMoneyCard(a);
+    $("#remove").onclick = () => confirmRemove(a);
     $("#close").onclick = () => sheet.close();
     $("#play").onclick = () => play(a.id);
     if (a.resume) $("#resume").onclick = () => resume(a.id);
@@ -385,6 +400,93 @@
   }
   sheet.addEventListener("click", (e) => { if (e.target === sheet) sheet.close(); });
 
+
+  // --- value card (album sheet) ----------------------------------------------------
+  function moneyCard(a) {
+    const perListen = a.paid != null && a.full_listens ? money(a.paid / a.full_listens) : "";
+    const valueSrc = a.value == null ? "Not priced yet" : a.value_source === "discogs"
+      ? `Discogs${a.value_at ? `, ${esc(a.value_at.slice(0, 10))}` : ""}` : "Typed in";
+    const paidSrc = a.paid == null ? "Not recorded" : a.paid_source === "notes" ? "From your spreadsheet notes" : "Typed in";
+    return `<div class="card" id="money" style="display:flex;flex-direction:column;gap:12px">
+      <div class="row"><h2 class="grow">Value</h2>${a.value != null ? `<span class="tier">${tierOf(a.value)}</span>` : ""}
+        <button type="button" class="btn ghost" id="money-edit" style="min-height:32px;font-size:13px;padding:0 10px">Edit</button></div>
+      <div class="money">
+        <div><div class="amt">${a.value != null ? money(a.value) : "—"}</div><div class="src">Market value · ${valueSrc}</div></div>
+        <div><div class="amt">${a.paid != null ? money(a.paid) : "—"}</div><div class="src">You paid · ${paidSrc}</div></div>
+      </div>
+      ${perListen ? `<div class="quiet" style="font-size:13px">${perListen} per full listen so far</div>` : ""}
+      <form id="money-form" hidden style="display:flex;flex-direction:column;gap:10px">
+        <div class="row">
+          <div class="field grow"><label for="m-value">Market value ($)</label><input id="m-value" type="text" inputmode="decimal" value="${a.value ?? ""}" placeholder="e.g. 12.50"></div>
+          <div class="field grow"><label for="m-paid">You paid ($)</label><input id="m-paid" type="text" inputmode="decimal" value="${a.paid ?? ""}" placeholder="e.g. 9.99"></div>
+        </div>
+        <div class="quiet" style="font-size:12px">Leave a box empty to clear it. Discogs prices will fill in market value once it's connected.</div>
+        <div class="form-error" id="m-err" role="alert"></div>
+        <div class="row"><button type="button" class="btn ghost grow" id="m-cancel">Cancel</button><button type="submit" class="btn primary grow">Save</button></div>
+      </form>
+    </div>`;
+  }
+  function bindMoneyCard(a) {
+    const form = $("#money-form");
+    $("#money-edit").onclick = () => { form.hidden = false; $("#money-edit").hidden = true; $("#m-value").focus(); };
+    $("#m-cancel").onclick = () => { form.hidden = true; $("#money-edit").hidden = false; };
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      try {
+        await api(`albums/${a.id}/money`, { method: "PUT", json: { value: $("#m-value").value.trim(), paid: $("#m-paid").value.trim() } });
+        toast("Saved");
+        openAlbum(a.id);
+        if ((location.hash || "#library") === "#library") { await loadAlbums(); drawGrid(); }
+      } catch (err) { $("#m-err").textContent = err.message; }
+    };
+  }
+
+  // --- loans: preview of a later release --------------------------------------------
+  function loanPreview() {
+    return `<div class="card soon" aria-disabled="true" style="display:flex;flex-direction:column;gap:10px">
+      <div class="row"><h2 class="grow">Loan this disc</h2><span class="soon-tag">Coming soon</span></div>
+      <div class="row">
+        <div class="field grow"><label>Who has it</label><input type="text" placeholder="Name" disabled tabindex="-1"></div>
+        <div class="field" style="width:120px"><label>Return by</label><input type="text" placeholder="Nov 1" disabled tabindex="-1"></div>
+      </div>
+      <div class="quiet" style="font-size:12px">Remembers its slot, reminds you after 7 days, and puts it back when it's returned.</div>
+      <button type="button" class="btn block" disabled tabindex="-1">Loan it</button>
+    </div>`;
+  }
+
+  // --- removing an album --------------------------------------------------------
+  async function confirmRemove(a) {
+    let p;
+    try { p = await api(`albums/${a.id}/remove-preview`); } catch (err) { return toast(err.message); }
+    const lines = [];
+    if (p.discs.length > 1) lines.push(`All ${p.discs.length} discs of this set are removed together.`);
+    p.slots.forEach((d) => lines.push(`Frees ${esc(changerName(d.changer_id))} slot ${d.slot}.`));
+    if (p.listens) lines.push(`Its ${p.listens} listen${p.listens === 1 ? "" : "s"} stop counting in Stats.`);
+    lines.push("Re-importing the spreadsheet won't bring it back.");
+    lines.push("You can restore it any time from Settings → Removed albums.");
+    $("#remove-box").innerHTML = `<div class="card confirm" style="display:flex;flex-direction:column;gap:10px">
+      <div style="font-weight:600">Remove “${esc(a.title)}” by ${esc(a.artist)}?</div>
+      <ul>${lines.map((l) => `<li>${l}</li>`).join("")}</ul>
+      <div class="row"><button type="button" class="btn ghost grow" id="rm-cancel">Cancel</button>
+        <button type="button" class="btn danger solid grow" id="rm-yes">Remove</button></div></div>`;
+    $("#remove-box").scrollIntoView({ block: "nearest", behavior: "smooth" });
+    $("#rm-cancel").onclick = () => openAlbum(a.id);
+    $("#rm-yes").onclick = async () => {
+      try {
+        await api(`albums/${a.id}`, { method: "DELETE" });
+        sheet.close();
+        toast(`Removed ${a.title}`, { label: "Undo", run: () => restoreAlbum(a.id, a.title) });
+        route();
+      } catch (err) { toast(err.message); }
+    };
+  }
+  async function restoreAlbum(id, title) {
+    try {
+      const r = await api(`albums/${id}/restore`, { method: "POST" });
+      toast(r.back_in_slot.length ? `${title} is back in its slot` : `${title} is back (not placed in a changer)`);
+      route();
+    } catch (err) { toast(err.message); }
+  }
 
   // --- pressing card (album sheet) -------------------------------------------------
   const normCat = (s) => String(s || "").toUpperCase().replace(/[^0-9A-Z]/g, "");
@@ -711,8 +813,8 @@
       </div>
       <div id="stats-body"><div class="empty">Loading…</div></div>`;
     view.querySelectorAll("[data-r]").forEach((b) => (b.onclick = () => { state.statsRange = b.dataset.r; renderStats(); }));
-    let s, hist;
-    try { [s, hist] = await Promise.all([api(`stats?range=${state.statsRange}`), api("history?limit=20")]); }
+    let s, hist, col;
+    try { [s, hist, col] = await Promise.all([api(`stats?range=${state.statsRange}`), api("history?limit=20"), api("collection").catch(() => null)]); }
     catch (err) { return toast(err.message); }
     const maxG = Math.max(1, ...s.by_genre.map((g) => g.full_listens));
     $("#stats-body").outerHTML = `
@@ -738,7 +840,8 @@
         <div class="genre-row"><span class="ellipsis">${esc(g.genre)}</span><div class="bar"><span style="width:${(g.full_listens / maxG) * 100}%"></span></div><span class="quiet" style="text-align:right">${g.full_listens}</span></div>`).join("")}</div>` : ""}
       ${s.most_played.length ? `<h2>Most played</h2><div>${s.most_played.map((m, i) => `
         <div class="list-row" style="font-size:14px"><span class="quiet" style="width:18px">${i + 1}</span>
-          <span class="grow ellipsis">${esc(m.title)} <span class="quiet">· ${esc(m.artist)}</span></span><span class="quiet">${m.plays} play${m.plays === 1 ? "" : "s"}</span></div>`).join("")}</div>` : ""}`;
+          <span class="grow ellipsis">${esc(m.title)} <span class="quiet">· ${esc(m.artist)}</span></span><span class="quiet">${m.plays} play${m.plays === 1 ? "" : "s"}</span></div>`).join("")}</div>` : ""}
+      ${col ? collectionHTML(col) : ""}`;
     view.querySelectorAll("[data-resume]").forEach((b) => (b.onclick = () => resume(Number(b.dataset.resume))));
   }
 
@@ -797,6 +900,14 @@
         </div>
       </div>
 
+      <h2>Value</h2>
+      <div class="set-group">
+        <div class="set-row"><div class="grow"><div class="label">Show value marks on covers</div>
+          <div class="help">$ under $9 · $$ $9–24 · $$$ $25 and up. Values always show when you open an album.</div></div>${sw("show_value_marks", p.show_value_marks)}</div>
+        <div class="set-row"><div class="grow"><div class="label">Discogs prices</div>
+          <div class="help">Market values for each pressing, refreshed monthly. Needs your Discogs token.</div></div><span class="soon-tag">Next</span></div>
+      </div>
+
       <h2>Catalog</h2>
       <div class="set-group">
         <div class="set-row"><div class="grow"><div class="label">Import spreadsheet</div>
@@ -805,6 +916,16 @@
         <div class="set-row"><div class="grow"><div class="label">Export pressings</div>
           <div class="help">An Excel file with verified catalog numbers, barcodes and matched releases.</div></div>
           <a class="btn" href="api/pressings/export" download>Export</a></div>
+        <div class="set-row stack" id="removed-row"><div style="display:flex;align-items:center;gap:12px"><div class="grow"><div class="label">Removed albums</div>
+          <div class="help" id="removed-help">Loading…</div></div>
+          <button type="button" class="btn" id="removed-toggle" hidden>Show</button></div>
+          <div id="removed-list" hidden></div></div>
+      </div>
+
+      <h2>Loans</h2>
+      <div class="set-group soon" aria-disabled="true">
+        <div class="set-row"><div class="grow"><div class="label">Out on loan</div>
+          <div class="help">Who has which disc, since when, with a reminder after 7 days.</div></div><span class="soon-tag">Coming soon</span></div>
       </div>
 
       <h2>Changers</h2>
@@ -838,6 +959,59 @@
     if ($("#sync-stop")) $("#sync-stop").onclick = async () => { await api("enrich/stop", { method: "POST" }); renderSettings(); };
     $("#set-import").addEventListener("change", importCatalog);
     renderStorage();
+    drawRemoved();
+  }
+
+  async function drawRemoved() {
+    const rows = await api("removed").catch(() => []);
+    if (!$("#removed-help")) return;
+    $("#removed-help").textContent = rows.length
+      ? `${rows.length} album${rows.length === 1 ? "" : "s"} removed. Re-imports skip them until you restore them.`
+      : "Nothing removed. Remove an album from the bottom of its page.";
+    const toggle = $("#removed-toggle"), list = $("#removed-list");
+    toggle.hidden = !rows.length;
+    list.innerHTML = rows.map((r) => `<div class="list-row">${art(r, "sm")}
+        <div class="grow" style="min-width:0"><div class="ellipsis" style="font-weight:600">${esc(r.title)}</div>
+          <div class="quiet ellipsis" style="font-size:12px">${esc(r.artist)} · removed ${esc((r.removed_at || "").slice(0, 10))}</div></div>
+        <button type="button" class="btn" data-restore="${r.id}" data-title="${esc(r.title)}" style="min-height:36px">Restore</button></div>`).join("");
+    toggle.onclick = () => { list.hidden = !list.hidden; toggle.textContent = list.hidden ? "Show" : "Hide"; };
+    list.onclick = (e) => {
+      const b = e.target.closest("[data-restore]");
+      if (b) restoreAlbum(Number(b.dataset.restore), b.dataset.title);
+    };
+  }
+
+  function collectionHTML(c) {
+    const runtime = c.runtime_sec >= 86400 ? `${(c.runtime_sec / 86400).toFixed(1)}<small> days</small>` : `${Math.round(c.runtime_sec / 3600)}<small> hrs</small>`;
+    const m = c.money;
+    const maxF = Math.max(1, ...Object.values(c.formats));
+    const kpi = (label, v, sub = "") => `<div class="kpi"><div class="quiet" style="font-size:13px">${label}</div><div class="v">${v}</div>${sub ? `<div class="quiet" style="font-size:12px">${sub}</div>` : ""}</div>`;
+    return `
+      <h2>Collection</h2>
+      <div class="kpis">
+        ${kpi("Albums", c.albums, c.on_order ? `${c.on_order} on order` : "")}
+        ${kpi("Discs", c.discs, `${c.audio} audio · ${c.video} video`)}
+        ${kpi("Play time", c.runtime_known ? runtime : "—", c.runtime_known ? `to hear everything once · ${c.runtime_known} of ${c.audio} timed` : "Fills in as albums are looked up")}
+        ${kpi("Not in a changer", c.not_in_changer, "discs on shelves or not placed")}
+      </div>
+      ${c.changers.map((ch) => `<div style="display:flex;flex-direction:column;gap:6px">
+        <div class="row" style="font-size:14px"><span class="grow">${esc(ch.name)}</span><span class="quiet">${ch.used} of ${ch.capacity} slots · ${ch.capacity - ch.used} free</span></div>
+        <div class="bar thick"><span style="width:${(ch.used / ch.capacity) * 100}%"></span></div></div>`).join("")}
+      <div style="display:flex;flex-direction:column;gap:10px">${Object.entries(c.formats).map(([f, n]) => `
+        <div class="genre-row"><span class="ellipsis">${esc(f)}</span><div class="bar"><span style="width:${(n / maxF) * 100}%"></span></div><span class="quiet" style="text-align:right">${n}</span></div>`).join("")}</div>
+
+      <h2>Money</h2>
+      <div class="kpis">
+        ${kpi("Collection value", m.value_known ? money(Math.round(m.value_total)) : "—", m.value_known ? `${m.value_known} of ${c.albums} priced` : "Waiting on Discogs prices")}
+        ${kpi("You paid", m.paid_known ? money(Math.round(m.paid_total)) : "—", m.paid_known ? `known for ${m.paid_known} of ${c.albums}` : "")}
+        ${kpi("Average value", m.value_avg != null ? money(m.value_avg) : "—")}
+        ${kpi("Cost per listen", m.cost_per_listen != null ? money(m.cost_per_listen) : "—", "what you paid ÷ full listens")}
+      </div>
+      ${m.value_known ? `<div class="row" style="gap:8px">${[["$", "under $9"], ["$$", "$9–24"], ["$$$", "$25+"]].map(([t, l]) =>
+        `<div class="kpi grow" style="padding:10px 12px"><span class="tier">${t}</span> <span class="quiet" style="font-size:12px">${l}</span><div style="font-weight:700;font-size:20px">${m.tiers[t]}</div></div>`).join("")}</div>` : ""}
+      ${m.top.length ? `<h2>Most valuable</h2><div>${m.top.map((t, i) => `
+        <div class="list-row" style="font-size:14px"><span class="quiet" style="width:18px">${i + 1}</span>
+          <span class="grow ellipsis">${esc(t.title)} <span class="quiet">· ${esc(t.artist)}</span></span><span style="font-weight:600">${money(t.value)}</span></div>`).join("")}</div>` : ""}`;
   }
 
   function fmtBytes(n) {
