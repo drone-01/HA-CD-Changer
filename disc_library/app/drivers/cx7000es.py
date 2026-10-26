@@ -82,6 +82,23 @@ def parse(reply: bytes) -> tuple[int, int, bytes] | None:
     return body[0], body[1], body[2:]
 
 
+def parse_all(reply: bytes) -> list[tuple[int, int, bytes]]:
+    """Every data frame in a reply (some requests, like the slot bitmap, answer with several frames)."""
+    out, i = [], 0
+    while i + 4 < len(reply):
+        if reply[i] != 0x02:
+            i += 1
+            continue
+        length = reply[i + 1]
+        p = parse(reply[i:i + 3 + length])
+        if p:
+            out.append(p)
+            i += 3 + length
+        else:
+            i += 1
+    return out
+
+
 class Cx7000esDriver(ChangerDriver):
     def __init__(self, cfg: ChangerConfig, client_factory=None, clock=time.monotonic):
         super().__init__(cfg)
@@ -172,11 +189,27 @@ class Cx7000esDriver(ChangerDriver):
         return text or None
 
     async def occupied_slots(self) -> list[int]:
-        """Slots the changer reports as holding a disc (for the slot audit)."""
+        """Slots the changer reports as holding a disc (for the slot check).
+
+        The request carries no data; the answer is five frames, one per 80 slots, each starting with
+        its packet number (0-4) followed by ten bitmap bytes, bit 0 = the lowest slot.
+        """
+        packets: dict[int, bytes] = {}
+        reply = await self._raw(frame(self.pdc, IP_DISC_EXIST))
+        log.info("%s: slot bitmap reply %s", self.name, reply.hex())
+        for pdc, cmd, data in parse_all(reply):
+            if cmd == IP_DISC_EXIST and len(data) >= 11 and data[0] <= 4:
+                packets[data[0]] = data[1:11]
+        for packet in range(5):  # some firmware answers one packet per request: ask for any that are missing
+            if packet not in packets:
+                for pdc, cmd, data in parse_all(await self._raw(frame(self.pdc, IP_DISC_EXIST, bytes([packet])))):
+                    if cmd == IP_DISC_EXIST and len(data) >= 11 and data[0] <= 4:
+                        packets.setdefault(data[0], data[1:11])
+        if len(packets) < 5:
+            raise ChangerCommandError(f"{self.name} didn't report all of its slots.")
         slots: list[int] = []
-        for packet in range(5):
-            d = await self._request(IP_DISC_EXIST, bytes([packet]))
-            for i, byte in enumerate(d[1:11]):
+        for packet, bits in sorted(packets.items()):
+            for i, byte in enumerate(bits):
                 for bit in range(8):
                     if byte & (1 << bit):
                         slots.append(packet * 80 + i * 8 + bit + 1)

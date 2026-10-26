@@ -66,6 +66,17 @@ class FakeChanger:
             self.state = 0x11
         elif cmd == 0x14:
             self.state = 0x10
+        elif cmd == 0xCC and not data:  # slot bitmap: five frames in one answer
+            out = b""
+            for packet in range(5):
+                bits = bytearray(10)
+                if packet == 0:
+                    bits[0] = 0b00000001          # slot 1
+                    bits[1] = 0b00000010          # slot 10
+                if packet == 4:
+                    bits[9] = 0b10000000          # slot 400
+                    bits[4] = 0b00000001          # slot 353
+                out += self.reply(pdc, 0xCC, bytes([packet]) + bytes(bits))
         elif cmd == 0x50:
             out = b"\xfe"
         return httpx.Response(200, text=f"<s:Envelope><s:Body><u:X_CIS_CommandResponse><Res_CISDATA>{out.hex()}"
@@ -133,3 +144,9 @@ def test_offline_and_refused():
         with pytest.raises(ChangerCommandError):
             await drv2._command(0x50, b"\x01")
     run(go())
+
+
+def test_occupied_slots_reads_all_five_packets():
+    fake = FakeChanger()
+    drv, _ = make(fake)
+    assert run(drv.occupied_slots()) == [1, 10, 353, 400]
