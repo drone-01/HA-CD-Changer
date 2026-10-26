@@ -24,7 +24,7 @@ from .enrich import catalog_candidates
 log = logging.getLogger(__name__)
 
 API = "https://api.discogs.com"
-USER_AGENT = "DiscLibrary/0.6 +https://github.com/drone-01/HA-CD-Changer"
+USER_AGENT = "DiscLibrary/0.7 +https://github.com/drone-01/HA-CD-Changer"
 CONDITIONS = ["Mint (M)", "Near Mint (NM or M-)", "Very Good Plus (VG+)", "Very Good (VG)",
               "Good Plus (G+)", "Good (G)", "Fair (F)", "Poor (P)"]
 DEFAULT_CONDITION = "Very Good (VG)"

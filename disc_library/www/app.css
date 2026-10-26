@@ -223,3 +223,13 @@ dialog#sheet::backdrop { background: rgba(0,0,0,0.6); }
 .soon-tag { display: inline-flex; align-items: center; min-height: 22px; padding: 0 8px; border-radius: 11px; font-size: 11px;
   font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; background: var(--panel-2); color: var(--quiet); }
 .fmt-row { display: grid; grid-template-columns: minmax(0, 1fr) 40px; gap: 10px; align-items: center; font-size: 14px; }
+
+/* loading discs */
+.nextslot { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 16px; }
+.nextslot .big { font-size: 64px; font-weight: 800; line-height: 1; color: var(--accent); font-variant-numeric: tabular-nums; }
+.card.loaded { border: 1px solid var(--good); }
+.slotline { font-size: 22px; line-height: 1.25; margin: 2px 0 4px; }
+.slotline strong { color: var(--accent); font-size: 28px; }
+.notes-bg p { margin: 0 0 4px; font-size: 14px; line-height: 1.5; }
+.mcard { display: flex; align-items: center; gap: 12px; background: var(--panel); border-radius: 14px; padding: 10px 12px; }
+.mcard .btn { flex: none; }

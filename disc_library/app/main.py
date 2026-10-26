@@ -32,6 +32,8 @@ from .importer import import_workbook
 from .prefs import Prefs, PrefsError
 from .library import Library, LocationError, RemoveError
 from .sets import merge_sets
+from .onboard import Onboarding, OnboardError
+from .notes import LinerNotes
 from .discogs import CONDITIONS, Discogs, DiscogsAuthError, ValueUpdater
 from .player import PlayError, Player
 
@@ -51,6 +53,18 @@ class LinkBody(BaseModel):
 
 class PulledBody(BaseModel):
     disc_ids: list[int]
+
+
+class LoadBody(BaseModel):
+    album_id: int
+    changer_id: int
+    barcode: str | None = None
+
+
+class SkipBody(BaseModel):
+    changer_id: int
+    slot: int
+    note: str | None = None
 
 
 class ManualLockBody(BaseModel):
@@ -125,6 +139,8 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
     if enricher.prefs is None:
         enricher.prefs = prefs
     values = values or ValueUpdater(db, prefs)
+    onboard = Onboarding(db, library, enricher)
+    notes = LinerNotes(db, enricher)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -246,6 +262,55 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
                decade: int | None = None):
         return library.albums(q=q, genre=genre, favorites=favorites, decade=decade,
                               media_kind=None if media == "all" else media, sort=sort, limit=limit, offset=offset)
+
+    # --- loading discs into the changers ---------------------------------------------
+    def _ob(fn, *a):
+        try:
+            return fn(*a)
+        except (OnboardError, LocationError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/onboard/status")
+    def onboard_status(changer_id: int):
+        return _ob(onboard.status, changer_id)
+
+    @app.get("/api/onboard/identify")
+    async def onboard_identify(code: str):
+        return await onboard.identify(code)
+
+    @app.get("/api/onboard/unplaced")
+    def onboard_unplaced(q: str | None = None, limit: int = 60):
+        return library.albums(q=q, media_kind=None, status=None, unplaced=True, limit=limit)
+
+    @app.post("/api/onboard/load")
+    async def onboard_load(body: LoadBody):
+        try:
+            return await onboard.load(body.album_id, body.changer_id, body.barcode)
+        except (OnboardError, LocationError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/onboard/undo")
+    def onboard_undo(body: PulledBody):
+        return {"undone": _ob(onboard.undo, body.disc_ids)}
+
+    @app.post("/api/onboard/skip")
+    def onboard_skip(body: SkipBody):
+        return _ob(onboard.skip, body.changer_id, body.slot, body.note)
+
+    @app.delete("/api/onboard/skip")
+    def onboard_unskip(changer_id: int, slot: int):
+        return _ob(onboard.unskip, changer_id, slot)
+
+    @app.get("/api/onboard/skipped")
+    def onboard_skipped():
+        return onboard.skipped()
+
+    # --- liner notes -------------------------------------------------------------------
+    @app.get("/api/albums/{album_id}/notes")
+    async def album_notes(album_id: int, refresh: bool = False):
+        if not library.album(album_id):
+            raise HTTPException(404, "Album not found")
+        return await notes.get(album_id, refresh)
 
     @app.get("/api/decades")
     def decades():

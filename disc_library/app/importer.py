@@ -169,10 +169,12 @@ def import_workbook(db: Database, path: Path | str) -> dict:
                 album_id = existing["id"]
                 con.execute(
                     """UPDATE albums SET artist=?, title=?, year=?, label=?, catalog_no=?, format=?,
-                       media_kind=?, edition_notes=?, status=?, source_sheet=?, updated_at=datetime('now')
+                       media_kind=?, edition_notes=?, source_sheet=?, updated_at=datetime('now'),
+                       status = CASE WHEN status_override = 'owned' THEN 'owned' ELSE ? END,
+                       status_override = CASE WHEN ? = 'owned' THEN NULL ELSE status_override END
                        WHERE id=?""",
                     (r["artist"], r["title"], r["year"], r["label"], catalog, r["format"],
-                     r["media_kind"], r["edition_notes"], status, r["source_sheet"], album_id),
+                     r["media_kind"], r["edition_notes"], r["source_sheet"], status, status, album_id),
                 )
                 con.execute(
                     """UPDATE albums SET paid = ?, paid_source = CASE WHEN ? IS NULL THEN NULL ELSE 'notes' END

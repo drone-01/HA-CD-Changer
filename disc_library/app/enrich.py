@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 MB_BASE = "https://musicbrainz.org/ws/2"
 CAA_BASE = "https://coverartarchive.org"
 APPLE_SEARCH = "https://itunes.apple.com/search"
-USER_AGENT = "DiscLibrary/0.3 ( https://github.com/drone-01/HA-CD-Changer )"
+USER_AGENT = "DiscLibrary/0.7 ( https://github.com/drone-01/HA-CD-Changer )"
 MIN_SCORE = 105          # see pick_release(); a clean artist+title hit scores ~135
 MBID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 

@@ -81,6 +81,22 @@ CREATE TABLE IF NOT EXISTS import_aliases (
     disc_number   INTEGER NOT NULL
 );
 
+-- Slots skipped while loading (something unknown is in them, or the slot is damaged) (v0.7.0).
+CREATE TABLE IF NOT EXISTS slot_blocks (
+    changer_id    INTEGER NOT NULL,
+    slot          INTEGER NOT NULL,
+    note          TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (changer_id, slot)
+);
+
+-- Liner notes fetched on demand (v0.7.0).
+CREATE TABLE IF NOT EXISTS album_notes (
+    album_id      INTEGER PRIMARY KEY REFERENCES albums(id) ON DELETE CASCADE,
+    data          TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS ix_sessions_album ON sessions(album_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_started ON sessions(started_at);
 CREATE INDEX IF NOT EXISTS ix_albums_artist ON albums(artist, year);
@@ -118,7 +134,8 @@ MIGRATIONS = {
         "value_source": "TEXT",                 # discogs | manual
         "value_at": "TEXT",
         "discogs_release": "TEXT",
-        "value_basis": "TEXT",                  # VG | lowest listing | no price on Discogs | not found (v0.6.0)
+        "value_basis": "TEXT",
+        "status_override": "TEXT",              # 'owned' once a disc on order is scanned in (v0.7.0)                  # VG | lowest listing | no price on Discogs | not found (v0.6.0)
     },
     "sessions": {
         "last_disc": "INTEGER NOT NULL DEFAULT 1",   # disc of a set the session was on (v0.6.0)

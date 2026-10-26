@@ -72,8 +72,12 @@ class Library:
     # --- browse ----------------------------------------------------------------
     def albums(self, q: str | None = None, genre: str | None = None, favorites: bool = False,
                media_kind: str | None = "audio", status: str | None = "owned", sort: str = "artist",
-               limit: int = 1000, offset: int = 0, decade: int | None = None) -> list[dict]:
+               limit: int = 1000, offset: int = 0, decade: int | None = None,
+               unplaced: bool = False) -> list[dict]:
         where, params = ["a.removed_at IS NULL"], []
+        if unplaced:
+            where.append("""a.status IN ('owned', 'on_order') AND a.enrich_status != 'skipped' AND EXISTS (SELECT 1 FROM discs u WHERE u.album_id = a.id
+                            AND u.location_type NOT IN ('changer', 'to_pull'))""")
         if decade:
             where.append(f"{ALBUM_YEAR} BETWEEN ? AND ?")
             params += [decade, decade + 9]
@@ -151,6 +155,10 @@ class Library:
             )
             if taken:
                 raise LocationError(f"Slot {slot} already holds {taken['artist']} - {taken['title']}.")
+            blocked = self.db.one("SELECT note FROM slot_blocks WHERE changer_id = ? AND slot = ?", (changer_id, slot))
+            if blocked:
+                raise LocationError(f"Slot {slot} was skipped while loading{': ' + blocked['note'] if blocked['note'] else ''}. "
+                                    "Clear it in Settings → Skipped slots first.")
         else:
             changer_id = slot = None
         self.db.execute(
@@ -165,7 +173,9 @@ class Library:
             self.changer_ids, key=lambda c: self._used(c)
         )
         for cid in candidates:
-            used = {r["slot"] for r in self.db.query("SELECT slot FROM discs WHERE changer_id = ?", (cid,))}
+            used = {r["slot"] for r in self.db.query(
+                "SELECT slot FROM discs WHERE changer_id = ? UNION SELECT slot FROM slot_blocks WHERE changer_id = ?",
+                (cid, cid))}
             for s in range(1, SLOTS_PER_CHANGER + 1):
                 if s not in used:
                     return {"changer_id": cid, "slot": s}

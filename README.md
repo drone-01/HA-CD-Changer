@@ -4,7 +4,7 @@ An album-first app for browsing and playing a physical disc collection across
 two Sony BDP-CX7000ES 400-disc changers. It runs as a Home Assistant add-on
 with its own sidebar panel, designed for the iPhone first.
 
-## What works today (v0.6.0)
+## What works today (v0.7.0)
 
 | Area | Status |
 | --- | --- |
@@ -104,6 +104,23 @@ request a second). Covers are saved in the add-on's data folder, so the grid sta
 - Stats → Collection: albums, discs, formats, changer slots used and free, discs not in a changer,
   total play time, collection value, paid, average value, cost per listen, most valuable.
 
+## Loading discs into the changers
+
+Library → **Load discs** (or Settings → Catalog). Pick a changer; the screen shows the next free slot.
+For each disc, photograph the barcode on the case (**Scan**), or type the barcode, catalog number,
+artist or album (a Bluetooth barcode scanner types straight into the box). The app answers with the
+slot to use; sets get one slot per disc. A barcode also pins the pressing: if it matches the release
+the album is matched to, the pressing is locked; if not, the album is re-matched to the release with
+that barcode. Scanning a disc that was on order marks it as arrived (a re-import won't flip it back).
+**Undo** reverses the last load; **Skip this slot** passes over a slot that's occupied or damaged
+(cleared in Settings → Skipped slots).
+
+## Liner notes
+
+Each matched album shows credits from MusicBrainz (produced, engineered, mixed and mastered by, and the
+players with their instruments) and a short background from Wikipedia with a link to the article.
+Fetched when the album is opened and kept for 90 days.
+
 ## Multi-disc sets
 
 A set is one album with one entry per disc, and each disc has its own location, so the discs of a set
@@ -145,3 +162,8 @@ MusicBrainz release it's matched to (label, country, date, format, catalog numbe
   and never touches locations, favorites, genres or history.
 - Multi-disc sets currently import as one album per row, matching the spreadsheet.
 - A session left open by a restart is closed as "interrupted" on start-up.
+
+## Third-party code
+
+`www/vendor/quagga.min.js` is [Quagga2](https://github.com/ericblade/quagga2) 1.13.0 (MIT licence, see
+`www/vendor/quagga.LICENSE`), used to read barcodes from photos.

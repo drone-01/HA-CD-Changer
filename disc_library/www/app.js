@@ -17,6 +17,7 @@
     search: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>',
     upload: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5M5 20h14"/></svg>',
     down: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>',
+    camera: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>',
   };
   const ART_COLORS = ["#5A4E3B", "#4A4A3B", "#3B4A5A", "#5A3B4D", "#3B5A55", "#5A3B3B", "#3F3B5A", "#4D5A3B"];
 
@@ -85,7 +86,7 @@
   }
 
   // --- routing -----------------------------------------------------------------
-  const routes = { library: renderLibrary, vibe: renderVibe, playing: renderPlaying, stats: renderStats, settings: renderSettings, pressings: () => renderPressings(), pull: renderPull };
+  const routes = { library: renderLibrary, vibe: renderVibe, playing: renderPlaying, stats: renderStats, settings: renderSettings, pressings: () => renderPressings(), pull: renderPull, load: renderLoad };
   function route() {
     const name = (location.hash || "#library").slice(1);
     const fn = routes[name] || renderLibrary;
@@ -181,6 +182,14 @@
     const pending = counts.pending || 0;
     const missed = (counts.not_found || 0) + (counts.error || 0);
     const extra = [];
+    let unplaced = null;
+    try { unplaced = state.load.status && state.load.status.changer_id ? state.load.status : await api(`onboard/status?changer_id=${(state.changers[0] || {}).id || 1}`); } catch { unplaced = null; }
+    if (unplaced && unplaced.unplaced_discs) {
+      extra.push(`<a class="card link" href="#load">
+        <div class="grow"><div style="font-weight:600">Load discs into the changers</div>
+        <div class="quiet" style="font-size:13px">${unplaced.unplaced_discs} disc${unplaced.unplaced_discs === 1 ? "" : "s"} not loaded yet. Scan, slot, next.</div></div>
+        <span style="color:var(--accent);font-weight:700">Start</span></a>`);
+    }
     if (pull.length) {
       extra.push(`<a class="card link" href="#pull" style="border:1px solid var(--danger)">
         <div class="grow"><div style="font-weight:600">Pull ${pull.length} disc${pull.length === 1 ? "" : "s"} from the changers</div>
@@ -353,6 +362,7 @@
         ${a.tracks.length ? [...new Set(a.tracks.map((t) => t.disc_number))].map((dn) => `
           ${a.discs.length > 1 ? `<h2>Disc ${dn}</h2>` : ""}
           <ol class="tracklist">${a.tracks.filter((t) => t.disc_number === dn).map((t) => `<li><span class="n">${t.number}</span><span class="grow ellipsis">${esc(t.title || "")}</span><span class="quiet" style="font-size:13px">${fmtLen(t.duration_sec)}</span></li>`).join("")}</ol>`).join("") : ""}
+        <section class="card" id="notes" style="display:flex;flex-direction:column;gap:10px"><h2>Liner notes</h2><div class="quiet" style="font-size:13px">Loading…</div></section>
         ${moneyCard(a)}
         ${pressingCard(a, statusText)}
         <form id="loc" class="card" style="display:flex;flex-direction:column;gap:10px">
@@ -425,6 +435,7 @@
     bindPressingCard(a);
     bindMoneyCard(a);
     bindLinkCard(a);
+    drawNotes(a);
     sheet.querySelectorAll("[data-play-disc]").forEach((b) => (b.onclick = () => play(a.id, 1, Number(b.dataset.playDisc))));
     sheet.querySelectorAll("[data-edit-disc]").forEach((b) => (b.onclick = () => {
       $("#loc-disc").value = b.dataset.editDisc; $("#loc-disc").onchange(); $("#loc").scrollIntoView({ block: "center", behavior: "smooth" });
@@ -441,6 +452,229 @@
   }
   sheet.addEventListener("click", (e) => { if (e.target === sheet) sheet.close(); });
 
+
+  // --- loading discs into the changers ---------------------------------------------
+  state.load = { changer: null, log: [], last: null };
+  let quaggaReady = null;
+  function loadQuagga() {
+    if (window.Quagga) return Promise.resolve();
+    quaggaReady = quaggaReady || new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = "vendor/quagga.min.js"; s.onload = res; s.onerror = () => rej(new Error("Couldn't load the barcode reader."));
+      document.head.appendChild(s);
+    });
+    return quaggaReady;
+  }
+  async function decodeBarcode(file) {
+    await loadQuagga();
+    const url = URL.createObjectURL(file);
+    try {
+      for (const size of [1600, 1000, 2400]) {
+        const code = await new Promise((res) => window.Quagga.decodeSingle({
+          src: url, numOfWorkers: 0, locate: true, inputStream: { size },
+          decoder: { readers: ["upc_reader", "ean_reader", "upc_e_reader", "ean_8_reader"] },
+        }, (r) => res(r && r.codeResult ? r.codeResult.code : null)));
+        if (code) return code;
+      }
+      return null;
+    } finally { URL.revokeObjectURL(url); }
+  }
+
+  async function renderLoad() {
+    if (!state.changers.length) state.changers = await api("changers").catch(() => []);
+    if (!state.load.changer) state.load.changer = (state.changers[0] || {}).id;
+    view.innerHTML = `
+      <a href="#library" class="btn ghost" style="align-self:flex-start;border:0;padding:0;color:var(--accent)">‹ Library</a>
+      <div><h1>Load discs</h1><p class="sub">Scan a case, put the disc in the slot shown, scan the next one.</p></div>
+      <div class="seg" role="group" aria-label="Changer" style="grid-template-columns:repeat(${Math.max(1, state.changers.length)},minmax(0,1fr))">
+        ${state.changers.map((c) => `<button type="button" data-ch="${c.id}" aria-pressed="${c.id === state.load.changer}">${esc(c.name)}</button>`).join("")}</div>
+      <div class="card nextslot" id="ld-next"><div class="quiet">Next slot</div><div class="big">…</div><div class="quiet" id="ld-free"></div></div>
+      <div id="ld-result"></div>
+      <form id="ld-form" class="search" style="padding-right:6px">${ICONS.search}
+        <label class="sr-only" for="ld-q">Barcode, catalog number, artist or album</label>
+        <input id="ld-q" type="search" placeholder="Barcode, catalog no., artist or album" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
+        <label class="btn primary" style="min-height:36px;padding:0 12px;border-radius:18px">${ICONS.camera}Scan
+          <input type="file" id="ld-cam" accept="image/*" capture="environment" class="sr-only"></label>
+      </form>
+      <div class="quiet" style="font-size:12px;margin-top:-6px">Photograph the barcode on the back of the case. A Bluetooth barcode scanner works too: it types into the box.</div>
+      <div id="ld-matches" style="display:flex;flex-direction:column;gap:10px"></div>
+      <details class="card" id="ld-browse"><summary style="cursor:pointer;font-weight:600;min-height:28px">Pick from albums not loaded yet</summary>
+        <div id="ld-unplaced" style="margin-top:8px"></div></details>
+      <div id="ld-log"></div>
+      <div class="row" style="flex-wrap:wrap;gap:8px">
+        <button type="button" class="btn ghost" id="ld-skip">Skip this slot</button>
+        <span class="quiet" style="font-size:12px;align-self:center">Use when a slot already has something unknown in it, or is damaged.</span>
+      </div>`;
+    view.querySelectorAll("[data-ch]").forEach((b) => (b.onclick = () => { state.load.changer = Number(b.dataset.ch); renderLoad(); }));
+    $("#ld-form").onsubmit = (e) => { e.preventDefault(); identify($("#ld-q").value); };
+    $("#ld-cam").onchange = async (e) => {
+      const f = e.target.files[0];
+      e.target.value = "";
+      if (!f) return;
+      $("#ld-matches").innerHTML = `<div class="quiet">Reading the barcode…</div>`;
+      try {
+        const code = await decodeBarcode(f);
+        if (!code) { $("#ld-matches").innerHTML = `<div class="warnbox">Couldn't read a barcode in that photo. Fill the frame with the barcode and keep it flat, or type the number.</div>`; return; }
+        $("#ld-q").value = code;
+        identify(code, true);
+      } catch (err) { $("#ld-matches").innerHTML = `<div class="warnbox">${esc(err.message)}</div>`; }
+    };
+    $("#ld-browse").addEventListener("toggle", () => { if ($("#ld-browse").open) drawUnplaced(); });
+    $("#ld-skip").onclick = skipSlot;
+    drawLoadStatus();
+    drawLoadLog();
+    if (state.load.last) drawLoadResult(state.load.last);
+    setTimeout(() => $("#ld-q") && $("#ld-q").focus(), 50);
+  }
+
+  async function drawLoadStatus() {
+    try {
+      const s = await api(`onboard/status?changer_id=${state.load.changer}`);
+      $("#ld-next .big").textContent = s.next_slot ?? "Full";
+      $("#ld-free").textContent = `${changerName(state.load.changer)} · ${s.free} free${s.skipped ? ` · ${s.skipped} skipped` : ""} · ${s.unplaced_discs} disc${s.unplaced_discs === 1 ? "" : "s"} still to load`;
+      state.load.status = s;
+    } catch (err) { toast(err.message); }
+  }
+
+  async function identify(code, fromCamera = false) {
+    code = (code || "").trim();
+    if (!code) return;
+    const box = $("#ld-matches");
+    box.innerHTML = `<div class="quiet">Looking…</div>`;
+    let r;
+    try { r = await api(`onboard/identify?code=${encodeURIComponent(code)}`); } catch (err) { box.innerHTML = `<div class="warnbox">${esc(err.message)}</div>`; return; }
+    const open = r.matches.filter((m) => !m.placed);
+    // A barcode that matches exactly one album not loaded yet: load it straight away.
+    if (r.kind === "barcode" && r.matches.length === 1 && open.length === 1) return doLoad(open[0].id, r.code);
+    if (!r.matches.length) {
+      box.innerHTML = r.kind === "barcode"
+        ? `<div class="warnbox">${r.lookup_failed ? "Couldn't reach MusicBrainz to look up that barcode." : r.release
+            ? `That's <strong>${esc(r.release.title)}</strong> by ${esc(r.release.artist)}${r.release.country ? ` (${esc(r.release.country)}${r.release.date ? ` ${esc(r.release.date.slice(0, 4))}` : ""})` : ""}, which isn't in your library. Add it to the spreadsheet and re-import, then scan again.`
+            : `Barcode ${esc(r.code)} isn't in your library or on MusicBrainz. Try the catalog number, artist or album instead.`}</div>`
+        : `<div class="empty"><strong>No match</strong>Try the barcode, catalog number, artist or album.</div>`;
+      return;
+    }
+    box.innerHTML = `${r.kind === "barcode" && r.release ? `<div class="quiet" style="font-size:13px">Barcode is ${esc(r.release.title)} by ${esc(r.release.artist)}. Closest albums in your library:</div>` : ""}
+      ${r.matches.map((m) => matchCard(m, r.kind === "barcode" ? r.code : null)).join("")}`;
+    box.querySelectorAll("[data-load]").forEach((b) => (b.onclick = () => doLoad(Number(b.dataset.load), b.dataset.code || null)));
+  }
+
+  function matchCard(m, code) {
+    const todo = m.discs.filter((d) => !["changer", "to_pull"].includes(d.location_type)).length;
+    const where = m.discs.filter((d) => d.location_type === "changer").map((d) => `${m.discs.length > 1 ? `disc ${d.disc_number}: ` : ""}${esc(changerName(d.changer_id))} slot ${d.slot}`).join(", ");
+    const next = state.load.status ? state.load.status.next_slot : null;
+    return `<div class="mcard">
+      ${art(m, "sm")}
+      <div class="grow" style="min-width:0">
+        <div class="ellipsis" style="font-weight:600">${esc(m.title)}</div>
+        <div class="quiet ellipsis" style="font-size:13px">${esc(m.artist)}${m.year ? ` · ${m.year}` : ""}${m.catalog ? ` · ${esc(m.catalog)}` : ""}</div>
+        <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:4px">
+          ${m.status === "on_order" ? `<span class="badge warn">On order</span>` : ""}
+          ${m.discs.length > 1 ? `<span class="badge">${m.discs.length} discs</span>` : ""}
+          ${m.reason === "catalog" ? `<span class="badge good">Catalog match</span>` : m.reason === "barcode" ? `<span class="badge good">Barcode match</span>` : ""}
+          ${where ? `<span class="badge">${where}</span>` : ""}
+        </div>
+      </div>
+      ${todo ? `<button type="button" class="btn primary" data-load="${m.id}" ${code ? `data-code="${esc(code)}"` : ""} style="min-height:40px">${todo > 1 ? `Load ${todo}` : `Slot ${next ?? ""}`}</button>` : `<span class="quiet" style="font-size:12px">Loaded</span>`}
+    </div>`;
+  }
+
+  async function doLoad(albumId, code) {
+    try {
+      const r = await api("onboard/load", { json: { album_id: albumId, changer_id: state.load.changer, barcode: code } });
+      state.load.last = r;
+      state.load.log.unshift(r);
+      $("#ld-q").value = "";
+      $("#ld-matches").innerHTML = "";
+      drawLoadResult(r);
+      drawLoadLog();
+      drawLoadStatus();
+      if ($("#ld-browse").open) drawUnplaced();
+      $("#ld-q").focus();
+    } catch (err) { $("#ld-matches").innerHTML = `<div class="warnbox">${esc(err.message)}</div>`; }
+  }
+
+  function drawLoadResult(r) {
+    const box = $("#ld-result");
+    if (!box) return;
+    const slots = r.assignments.map((x) => `${r.disc_count > 1 ? `Disc ${x.disc_number} → ` : ""}slot <strong>${x.slot}</strong>`).join("<br>");
+    const press = { locked: "Pressing confirmed by the barcode and locked.", rematched: "Barcode matched a different pressing; switched to it and locked.",
+      saved: "Barcode saved; check the pressing later.", differs: "This barcode differs from the locked pressing. Check it.", kept: "" }[r.pressing] || "";
+    box.innerHTML = `<div class="card loaded">
+      <div class="row" style="gap:12px;align-items:center">${art({ id: r.album_id, title: r.title, art_url: r.art_url }, "md")}
+        <div class="grow" style="min-width:0"><div class="quiet" style="font-size:12px">Put it in ${esc(changerName(r.assignments[0].changer_id))}</div>
+          <div class="slotline">${slots}</div>
+          <div class="ellipsis" style="font-weight:600">${esc(r.title)}</div><div class="quiet ellipsis" style="font-size:13px">${esc(r.artist)}</div></div>
+        <button type="button" class="btn ghost" id="ld-undo" style="min-height:36px">Undo</button></div>
+      ${r.arrived ? `<div class="quiet" style="font-size:13px;margin-top:8px">Was on order: marked as arrived.</div>` : ""}
+      ${press ? `<div style="font-size:13px;margin-top:6px;color:${r.pressing === "differs" ? "var(--danger)" : "var(--good)"}">${press}</div>` : ""}
+    </div>`;
+    $("#ld-undo").onclick = async () => {
+      try {
+        await api("onboard/undo", { json: { disc_ids: r.assignments.map((x) => x.disc_id) } });
+        state.load.log = state.load.log.filter((x) => x !== r);
+        state.load.last = null;
+        box.innerHTML = "";
+        toast("Undone");
+        drawLoadLog(); drawLoadStatus();
+      } catch (err) { toast(err.message); }
+    };
+  }
+
+  function drawLoadLog() {
+    const box = $("#ld-log");
+    if (!box) return;
+    const rows = state.load.log.slice(1);
+    box.innerHTML = rows.length ? `<h2>Loaded this session (${state.load.log.length})</h2>${rows.slice(0, 30).map((r) => `
+      <div class="list-row" style="font-size:14px"><span style="font-weight:700;min-width:64px">${r.assignments.map((x) => x.slot).join(", ")}</span>
+        <span class="grow ellipsis">${esc(r.title)} <span class="quiet">· ${esc(r.artist)}</span></span></div>`).join("")}` : "";
+  }
+
+  async function drawUnplaced() {
+    const box = $("#ld-unplaced");
+    box.innerHTML = `<div class="quiet">Loading…</div>`;
+    const rows = await api("onboard/unplaced?limit=500").catch(() => []);
+    box.innerHTML = rows.length ? rows.map((a) => `<button type="button" class="list-row" data-pick="${a.id}" style="width:100%;background:none;border:0;border-bottom:1px solid var(--line);text-align:left;cursor:pointer;color:var(--ink)">
+        ${art(a, "sm")}<div class="grow" style="min-width:0"><div class="ellipsis" style="font-weight:600">${esc(a.title)}</div>
+        <div class="quiet ellipsis" style="font-size:12px">${esc(a.artist)}${a.disc_count > 1 ? ` · ${a.disc_count} discs` : ""}${a.status === "on_order" ? " · on order" : ""}</div></div>
+        <span style="color:var(--accent);font-weight:700;font-size:13px">Load</span></button>`).join("")
+      : `<div class="quiet">Everything is loaded.</div>`;
+    box.onclick = (e) => { const b = e.target.closest("[data-pick]"); if (b) doLoad(Number(b.dataset.pick), null); };
+  }
+
+  async function skipSlot() {
+    const s = state.load.status;
+    if (!s || !s.next_slot) return;
+    const box = $("#ld-result");
+    box.innerHTML = `<div class="card" style="display:flex;flex-direction:column;gap:10px">
+      <div style="font-weight:600">Skip ${esc(changerName(state.load.changer))} slot ${s.next_slot}?</div>
+      <div class="field"><label for="sk-note">Why (optional)</label><input id="sk-note" type="text" placeholder="Unknown disc in it"></div>
+      <div class="row"><button type="button" class="btn ghost grow" id="sk-no">Cancel</button><button type="button" class="btn primary grow" id="sk-yes">Skip slot</button></div></div>`;
+    $("#sk-no").onclick = () => { box.innerHTML = ""; if (state.load.last) drawLoadResult(state.load.last); };
+    $("#sk-yes").onclick = async () => {
+      try { await api("onboard/skip", { json: { changer_id: state.load.changer, slot: s.next_slot, note: $("#sk-note").value } }); box.innerHTML = ""; toast(`Slot ${s.next_slot} skipped`); drawLoadStatus(); }
+      catch (err) { toast(err.message); }
+    };
+  }
+
+  // --- liner notes (album sheet) -------------------------------------------------------
+  async function drawNotes(a) {
+    const box = $("#notes");
+    if (!box) return;
+    let n;
+    try { n = await api(`albums/${a.id}/notes`); } catch { box.remove(); return; }
+    if (!$("#notes")) return;
+    if (!n.available) { box.innerHTML = `<h2>Liner notes</h2><div class="quiet" style="font-size:13px">${esc(n.reason || "No liner notes yet.")}</div>`; return; }
+    const bg = n.background;
+    const empty = !bg && !n.production.length && !n.personnel.length;
+    box.innerHTML = `<h2>Liner notes</h2>
+      ${bg ? `<div class="notes-bg"><p>${esc(bg.text)}</p><a href="${esc(bg.url)}" target="_blank" rel="noopener" style="font-size:13px">More on Wikipedia</a></div>` : ""}
+      ${n.production.length ? `<dl class="kv">${n.production.map((p) => `<dt>${esc(p.role)}</dt><dd>${p.names.map(esc).join(", ")}</dd>`).join("")}</dl>` : ""}
+      ${n.personnel.length ? `<div><div class="quiet" style="font-size:13px;margin-bottom:4px">Personnel</div>${n.personnel.slice(0, 40).map((p) =>
+        `<div style="font-size:14px;padding:3px 0"><strong style="font-weight:600">${esc(p.name)}</strong> <span class="quiet">— ${p.roles.map(esc).join(", ")}</span></div>`).join("")}</div>` : ""}
+      ${empty ? `<div class="quiet" style="font-size:13px">MusicBrainz has no credits for this release yet.</div>` : ""}
+      <a href="${esc(n.source)}" target="_blank" rel="noopener" class="quiet" style="font-size:12px">Credits from MusicBrainz</a>`;
+  }
 
   // --- multi-disc sets (album sheet) -----------------------------------------------
   function discsCard(a) {
@@ -1106,6 +1340,10 @@
         <div class="set-row"><div class="grow"><div class="label">Export pressings</div>
           <div class="help">An Excel file with verified catalog numbers, barcodes and matched releases.</div></div>
           <a class="btn" href="api/pressings/export" download>Export</a></div>
+        <div class="set-row"><div class="grow"><div class="label">Load discs</div>
+          <div class="help">Scan each case and the app gives you the slot.</div></div><a class="btn" href="#load">Open</a></div>
+        <div class="set-row stack" id="skipped-row"><div><div class="label">Skipped slots</div><div class="help" id="skipped-help">Loading…</div></div>
+          <div id="skipped-list"></div></div>
         <div class="set-row stack" id="removed-row"><div style="display:flex;align-items:center;gap:12px"><div class="grow"><div class="label">Removed albums</div>
           <div class="help" id="removed-help">Loading…</div></div>
           <button type="button" class="btn" id="removed-toggle" hidden>Show</button></div>
@@ -1151,6 +1389,24 @@
     renderStorage();
     drawRemoved();
     drawDiscogs(s);
+    drawSkipped();
+  }
+
+  async function drawSkipped() {
+    const rows = await api("onboard/skipped").catch(() => []);
+    if (!$("#skipped-help")) return;
+    if (!state.changers.length) state.changers = await api("changers").catch(() => []);
+    $("#skipped-help").textContent = rows.length ? "Slots passed over while loading. Clear one once it's empty and usable."
+      : "None. Slots you skip while loading show up here.";
+    $("#skipped-list").innerHTML = rows.map((r) => `<div class="list-row" style="font-size:14px"><span class="grow">${esc(changerName(r.changer_id))} · slot ${r.slot}${r.note ? ` <span class="quiet">— ${esc(r.note)}</span>` : ""}</span>
+      <button type="button" class="btn ghost" data-unskip="${r.changer_id}:${r.slot}" style="min-height:32px;font-size:13px">Clear</button></div>`).join("");
+    $("#skipped-list").onclick = async (e) => {
+      const b = e.target.closest("[data-unskip]");
+      if (!b) return;
+      const [c, sl] = b.dataset.unskip.split(":");
+      await api(`onboard/skip?changer_id=${c}&slot=${sl}`, { method: "DELETE" }).catch((err) => toast(err.message));
+      drawSkipped();
+    };
   }
 
   async function drawRemoved() {
