@@ -1,5 +1,5 @@
 name: "Disc Library"
-version: "0.8.0"
+version: "0.9.0"
 slug: "disc_library"
 description: "Browse and play your physical album collection across Sony disc changers."
 url: "https://github.com/drone-01/HA-CD-Changer"
@@ -14,6 +14,9 @@ ingress_port: 8099
 panel_icon: "mdi:album"
 panel_title: "Disc Library"
 homeassistant_api: true
+hassio_api: true
+services:
+  - mqtt:want
 options:
   changers:
     - name: "Changer 1"

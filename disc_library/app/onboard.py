@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import uuid
 
 import httpx
 
@@ -30,9 +31,33 @@ class OnboardError(ValueError):
     pass
 
 
+# Formats offered when adding a disc that isn't in the catalog, and whether each is audio or video.
+NEW_FORMATS = {"CD": "audio", "SACD": "audio", "DVD-Audio": "audio", "Blu-ray Audio": "audio",
+               "DVD": "video", "Blu-ray": "video", "4K Blu-ray": "video"}
+
+
+def guess_format(formats: list[str] | str | None, title: str = "") -> str:
+    """Map MusicBrainz / Discogs format words to one of NEW_FORMATS."""
+    words = " ".join(formats) if isinstance(formats, list) else (formats or "")
+    w = f"{words} {title}".lower()
+    if "dvd-audio" in w or "dvd audio" in w:
+        return "DVD-Audio"
+    if "blu" in w:
+        if "pure audio" in w or "blu-ray audio" in w:
+            return "Blu-ray Audio"
+        return "4K Blu-ray" if ("4k" in w or "uhd" in w or "ultra hd" in w) else "Blu-ray"
+    if "dvd" in w:
+        return "DVD"
+    if "sacd" in w or "hybrid" in w:
+        return "SACD"
+    return "CD"
+
+
 class Onboarding:
-    def __init__(self, db: Database, library: Library, enricher: Enricher):
+    def __init__(self, db: Database, library: Library, enricher: Enricher, prefs=None, discogs_factory=None):
         self.db, self.library, self.enricher = db, library, enricher
+        self.prefs = prefs
+        self.discogs_factory = discogs_factory or (lambda: httpx.AsyncClient(timeout=httpx.Timeout(20, connect=8)))
 
     # --- what is this disc? -----------------------------------------------------------
     def _summary(self, a: dict, reason: str) -> dict:
@@ -70,7 +95,7 @@ class Onboarding:
             log.info("barcode lookup failed: %s", exc)
             return {"kind": "barcode", "code": digits, "matches": [], "lookup_failed": True}
         if not releases:
-            return {"kind": "barcode", "code": digits, "matches": [], "release": None}
+            return {"kind": "barcode", "code": digits, "matches": [], "release": await self._discogs_release(digits)}
         rel = release_summary(releases[0])
         artist = rel.get("artist") or ""
         title = clean_title(releases[0].get("title") or "")
@@ -78,9 +103,33 @@ class Onboarding:
         scored = sorted(((similar(a["artist"], artist) + similar(clean_title(a["title"]), title), a) for a in library),
                         key=lambda x: -x[0])
         hits = [self._summary(a, "name") for s, a in scored[:5] if s >= 1.6]
+        date = rel.get("date") or ""
         return {"kind": "barcode", "code": digits, "matches": hits,
                 "release": {"artist": artist, "title": releases[0].get("title"), "id": releases[0].get("id"),
+                            "source": "musicbrainz", "year": int(date[:4]) if date[:4].isdigit() else None,
+                            "catno": (rel.get("catnos") or [None])[0],
+                            "disc_count": max(1, len(releases[0].get("media") or [])),
+                            "suggested_format": guess_format(rel.get("format"), releases[0].get("title") or ""),
                             **{k: rel.get(k) for k in ("label", "country", "date", "format")}}}
+
+    async def _discogs_release(self, digits: str) -> dict | None:
+        """MusicBrainz didn't know the barcode: ask Discogs, which also lists concert and music video discs."""
+        token = self.prefs.get("discogs_token") if self.prefs else ""
+        if not token:
+            return None
+        from .discogs import Discogs, DiscogsAuthError
+        try:
+            async with self.discogs_factory() as client:
+                hit = await Discogs(client, token).lookup_barcode(digits)
+        except (httpx.HTTPError, DiscogsAuthError) as exc:
+            log.info("Discogs barcode lookup failed: %s", exc)
+            return None
+        if not hit:
+            return None
+        return {"artist": hit["artist"], "title": hit["title"], "id": hit["id"], "source": "discogs",
+                "year": hit["year"], "label": hit["label"], "catno": hit["catno"], "country": hit["country"],
+                "format": ", ".join(hit["formats"]), "cover": hit["cover"], "disc_count": 1,
+                "suggested_format": guess_format(hit["formats"], hit["title"])}
 
     def _by_text(self, q: str) -> list[dict]:
         want = norm_catno(q)
@@ -169,6 +218,56 @@ class Onboarding:
             log.info("pressing lookup by barcode failed: %s", exc)
         self.db.execute("UPDATE albums SET barcode = ? WHERE id = ?", (digits, a["id"]))
         return "saved"
+
+    async def add_new(self, d: dict, changer_id: int) -> dict:
+        """Add a disc that isn't in the catalog (a concert DVD, a movie, a CD bought since the last import)
+        and put it straight into a slot."""
+        title = (d.get("title") or "").strip()
+        fmt = d.get("format") or "CD"
+        if fmt not in NEW_FORMATS:
+            raise OnboardError("Pick a format.")
+        kind = NEW_FORMATS[fmt]
+        artist = (d.get("artist") or "").strip() or ("Movie" if kind == "video" else "")
+        if not title or not artist:
+            raise OnboardError("Enter the artist and the title.")
+        discs = int(d.get("discs") or 1)
+        if not 1 <= discs <= 20:
+            raise OnboardError("A set can have 1 to 20 discs.")
+        year = d.get("year")
+        year = int(year) if str(year or "").isdigit() and 1900 <= int(year) <= 2100 else None
+        digits = _digits(d.get("barcode"))
+        if digits:
+            dup = next((a for a in self.db.query(
+                "SELECT id, artist, title, barcode, rel_barcode FROM albums WHERE removed_at IS NULL")
+                if digits in (_digits(a["barcode"]), _digits(a["rel_barcode"]))), None)
+            if dup:
+                raise OnboardError(f"That barcode is already in your library: {dup['artist']} - {dup['title']}.")
+        if changer_id not in self.library.changer_ids:
+            raise OnboardError("Pick one of the configured changers.")
+        if self.status(changer_id)["free"] < discs:
+            raise OnboardError("Not enough free slots left in this changer.")
+        catalog = (d.get("catno") or "").strip() or None
+        source = d.get("source")
+        key = f"manual|{digits or uuid.uuid4().hex}"
+        with self.db.connect() as con:
+            cur = con.execute(
+                """INSERT INTO albums (import_key, artist, title, year, label, catalog_no, format, media_kind, status,
+                       source_sheet, barcode, catalog_verified, enrich_status, pressing_locked, match_method,
+                       discogs_release, mbid_release, art_url, edition_notes)
+                   VALUES (?,?,?,?,?,?,?,?, 'owned', 'Added in app', ?,?,?,?,?,?,?,?,?)""",
+                (key, artist, title, year, (d.get("label") or None), catalog, fmt, kind, digits or None, catalog,
+                 "pending" if kind == "audio" else "manual", 0 if kind == "audio" else 1,
+                 "barcode" if digits else "manual",
+                 str(d["release_id"]) if source == "discogs" and d.get("release_id") else None,
+                 str(d["release_id"]) if source == "musicbrainz" and d.get("release_id") else None,
+                 d.get("cover") if kind == "video" else None,
+                 "Added while loading discs"))
+            album_id = cur.lastrowid
+            for n in range(1, discs + 1):
+                con.execute("INSERT INTO discs (album_id, disc_number) VALUES (?, ?)", (album_id, n))
+        out = await self.load(album_id, changer_id)
+        out["added"] = True
+        return out
 
     def undo(self, disc_ids: list[int]) -> int:
         n = 0

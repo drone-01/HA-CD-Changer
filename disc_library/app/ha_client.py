@@ -40,5 +40,8 @@ class HAClient:
             log.warning("Service call %s.%s failed: %s", domain, service, exc)
             return False
 
-    async def run_script(self, entity_id: str) -> bool:
-        return await self.call_service("script", "turn_on", {"entity_id": entity_id})
+    async def run_script(self, entity_id: str, variables: dict | None = None) -> bool:
+        data: dict = {"entity_id": entity_id}
+        if variables:
+            data["variables"] = variables
+        return await self.call_service("script", "turn_on", data)

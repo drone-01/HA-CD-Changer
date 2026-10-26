@@ -24,7 +24,7 @@ from .enrich import catalog_candidates
 log = logging.getLogger(__name__)
 
 API = "https://api.discogs.com"
-USER_AGENT = "DiscLibrary/0.7 +https://github.com/drone-01/HA-CD-Changer"
+USER_AGENT = "DiscLibrary/0.9 +https://github.com/drone-01/HA-CD-Changer"
 CONDITIONS = ["Mint (M)", "Near Mint (NM or M-)", "Very Good Plus (VG+)", "Very Good (VG)",
               "Good Plus (G+)", "Good (G)", "Fair (F)", "Poor (P)"]
 DEFAULT_CONDITION = "Very Good (VG)"
@@ -96,6 +96,24 @@ class Discogs:
             if pick:
                 return {"id": pick["id"], "title": pick.get("title"), "how": next(iter(q))}
         return None
+
+    async def lookup_barcode(self, barcode: str) -> dict | None:
+        """What release a barcode belongs to (for discs that aren't in the catalog yet)."""
+        r = await self._get("/database/search", {"barcode": barcode, "type": "release", "per_page": 10})
+        if r.status_code != 200:
+            return None
+        results = r.json().get("results") or []
+        if not results:
+            return None
+        top = results[0]
+        artist, _, title = (top.get("title") or "").partition(" - ")
+        if not title:
+            artist, title = "", artist
+        return {"id": top.get("id"), "artist": re.sub(r"\s*\(\d+\)$", "", artist.strip()) or None,
+                "title": title.strip(), "year": int(top["year"]) if str(top.get("year") or "").isdigit() else None,
+                "label": (top.get("label") or [None])[0], "catno": top.get("catno"),
+                "country": top.get("country"), "formats": top.get("format") or [],
+                "cover": top.get("cover_image") or None}
 
     async def price(self, release_id: int | str, condition: str) -> tuple[float | None, str, bool]:
         """(value, basis, suggestions_refused)."""

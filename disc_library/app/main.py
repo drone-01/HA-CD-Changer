@@ -33,6 +33,7 @@ from .prefs import Prefs, PrefsError
 from .library import Library, LocationError, RemoveError
 from .sets import merge_sets
 from .onboard import Onboarding, OnboardError
+from .mqtt_bridge import MqttBridge
 from .notes import LinerNotes
 from .discogs import CONDITIONS, Discogs, DiscogsAuthError, ValueUpdater
 from .player import PlayError, Player
@@ -59,6 +60,25 @@ class LoadBody(BaseModel):
     album_id: int
     changer_id: int
     barcode: str | None = None
+
+
+class SlotsBody(BaseModel):
+    slots: list[int]
+
+
+class NewDiscBody(BaseModel):
+    changer_id: int
+    artist: str | None = None
+    title: str
+    format: str = "CD"
+    year: int | None = None
+    label: str | None = None
+    catno: str | None = None
+    barcode: str | None = None
+    discs: int = 1
+    source: str | None = None
+    release_id: str | None = None
+    cover: str | None = None
 
 
 class SkipBody(BaseModel):
@@ -123,7 +143,8 @@ def _since(range_: str) -> str | None:
 
 
 def create_app(settings: Settings | None = None, drivers: dict | None = None, ha: HAClient | None = None,
-               enricher: Enricher | None = None, values: ValueUpdater | None = None) -> FastAPI:
+               enricher: Enricher | None = None, values: ValueUpdater | None = None,
+               mqtt: bool = True) -> FastAPI:
     settings = settings or load_settings()
     db = Database(settings.db_path)
     merged_sets = merge_sets(db)  # one-row-per-disc albums from before v0.6.0 become one album per set
@@ -139,8 +160,9 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
     if enricher.prefs is None:
         enricher.prefs = prefs
     values = values or ValueUpdater(db, prefs)
-    onboard = Onboarding(db, library, enricher)
+    onboard = Onboarding(db, library, enricher, prefs=prefs)
     notes = LinerNotes(db, enricher)
+    bridge = MqttBridge(player, drivers, __version__) if mqtt else None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -168,12 +190,16 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
 
         task = asyncio.create_task(poll_loop())
         vtask = asyncio.create_task(value_loop())
+        if bridge:
+            bridge.start()
         if merged_sets:
             log.info("Combined %s multi-disc sets; looking them up again", len(merged_sets))
             enricher.start()
         yield
         task.cancel()
         vtask.cancel()
+        if bridge:
+            await bridge.stop()
         for d in drivers.values():
             await d.close()
 
@@ -288,6 +314,21 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
             return await onboard.load(body.album_id, body.changer_id, body.barcode)
         except (OnboardError, LocationError) as exc:
             raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/onboard/new")
+    async def onboard_new(body: NewDiscBody):
+        try:
+            out = await onboard.add_new(body.model_dump(), body.changer_id)
+        except (OnboardError, LocationError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if out.get("added") and prefs.get("auto_sync_on_import"):
+            enricher.start()  # find the cover and track list for a new CD
+        return out
+
+    @app.get("/api/onboard/formats")
+    def onboard_formats():
+        from .onboard import NEW_FORMATS
+        return [{"format": k, "kind": v} for k, v in NEW_FORMATS.items()]
 
     @app.post("/api/onboard/undo")
     def onboard_undo(body: PulledBody):
@@ -453,6 +494,33 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
             out.append({"id": d.id, "name": d.name, "driver": d.cfg.driver, "status": st, **usage.get(d.id, {})})
         return out
 
+    @app.get("/api/changers/{changer_id}/audit")
+    async def changer_audit(changer_id: int):
+        d = drivers.get(changer_id)
+        if d is None:
+            raise HTTPException(404, "No such changer.")
+        if not hasattr(d, "occupied_slots"):
+            raise HTTPException(400, f"{d.name} can't report which slots hold a disc.")
+        try:
+            occupied = await d.occupied_slots()
+        except NotImplementedError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except (RuntimeError, OSError, httpx.HTTPError) as exc:
+            raise HTTPException(502, f"{d.name} didn't answer. If it's in standby, turn it on and try again. ({exc})") from exc
+        return library.audit(changer_id, occupied)
+
+    @app.post("/api/changers/{changer_id}/audit/skip")
+    def changer_audit_skip(changer_id: int, body: SlotsBody):
+        for slot in body.slots:
+            _ob(onboard.skip, changer_id, slot, "Unknown disc found by slot check")
+        return onboard.status(changer_id)
+
+    @app.post("/api/changers/{changer_id}/audit/clear")
+    def changer_audit_clear(changer_id: int, body: SlotsBody):
+        for slot in body.slots:
+            onboard.unskip(changer_id, slot)
+        return onboard.status(changer_id)
+
     @app.post("/api/import")
     async def import_xlsx(file: UploadFile = File(...)):
         if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
@@ -539,6 +607,7 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
             "conditions": CONDITIONS,
             "version": __version__,
             "configured_listen_script": settings.listen_script or "",
+            "ha_devices": bool(bridge and bridge.connected),
             "changers": changers,
         }
 

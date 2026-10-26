@@ -114,9 +114,7 @@ class Player:
                             await other.stop()
                     except NotImplementedError:
                         pass
-            script = (self.prefs.get("listen_script") if self.prefs else "") or self.listen_script
-            if self.ha and script:
-                await self.ha.run_script(script)
+            await self._scene(album, driver.id)
             try:
                 await driver.load_and_play(disc["slot"], from_track, track_count)
             except NotImplementedError as exc:
@@ -136,6 +134,19 @@ class Player:
         log.info("Playing %s - %s on %s slot %s from track %s",
                  album["artist"], album["title"], driver.name, disc["slot"], from_track)
         return await self.now_playing()
+
+    async def _scene(self, album: dict, changer_id: int) -> None:
+        """Run the theater scene in Home Assistant: Listen for audio, Watch for video, on this changer's input."""
+        if not self.ha:
+            return
+        video = album.get("media_kind") == "video"
+        prefs = self.prefs.all() if self.prefs else {}
+        script = (prefs.get("watch_script") if video else prefs.get("listen_script")) or \
+            ("" if video else self.listen_script) or ""
+        if not script:
+            return
+        source = (prefs.get("changer_inputs") or {}).get(str(changer_id))
+        await self.ha.run_script(script, {"source": source} if source else None)
 
     async def resume_album(self, album_id: int, user: str | None = None) -> dict:
         last = self.db.one(
@@ -224,6 +235,8 @@ class Player:
                 await self.drivers[a.changer_id].stop()
             except NotImplementedError:
                 pass
+            album = self.db.one("SELECT * FROM albums WHERE id = ?", (a.album_id,))
+            await self._scene(album, driver.id)  # the receiver moves to the other changer's input
         try:
             await driver.load_and_play(nxt["slot"], 1, count)
         except NotImplementedError:

@@ -190,6 +190,20 @@ class Library:
             for cid in self.changer_ids
         ]
 
+    def audit(self, changer_id: int, occupied: list[int]) -> dict:
+        """Compare the slots a changer reports as full with what the library has recorded."""
+        full = set(occupied)
+        recs = {r["slot"]: r for r in self.db.query(
+            """SELECT d.slot, d.disc_number, a.id AS album_id, a.artist, a.title FROM discs d JOIN albums a ON a.id = d.album_id
+               WHERE d.changer_id = ? AND d.location_type IN ('changer', 'to_pull')""", (changer_id,))}
+        skipped = {r["slot"] for r in self.db.query("SELECT slot FROM slot_blocks WHERE changer_id = ?", (changer_id,))}
+        return {"changer_id": changer_id, "occupied": len(full),
+                "matched": len(full & recs.keys()),
+                "unknown": sorted(full - recs.keys() - skipped),
+                "missing": [recs[s] for s in sorted(recs.keys() - full)],
+                "skipped_full": sorted(full & skipped),
+                "skipped_empty": sorted(skipped - full)}
+
     # --- removing ----------------------------------------------------------------
     def remove_preview(self, album_id: int) -> dict:
         a = self.db.one("SELECT id, artist, title, removed_at FROM albums WHERE id = ?", (album_id,))

@@ -22,7 +22,7 @@
   const ART_COLORS = ["#5A4E3B", "#4A4A3B", "#3B4A5A", "#5A3B4D", "#3B5A55", "#5A3B3B", "#3F3B5A", "#4D5A3B"];
 
   const state = {
-    q: "", filter: "all", sort: "artist", albums: [], genres: [], changers: [], prefs: {}, decade: "", decades: [],
+    q: "", filter: "all", media: "audio", sort: "artist", albums: [], genres: [], changers: [], prefs: {}, decade: "", decades: [],
     vibe: { mood: "Brooding", energy: "High", time_budget: "about_hour", familiarity: "rediscover" },
     vibePicks: null, statsRange: "year", now: { playing: false },
   };
@@ -102,7 +102,7 @@
 
   // --- Library -----------------------------------------------------------------
   async function loadAlbums() {
-    const params = new URLSearchParams({ sort: state.sort });
+    const params = new URLSearchParams({ sort: state.sort, media: state.media });
     if (state.q) params.set("q", state.q);
     if (state.decade) params.set("decade", state.decade);
     if (state.filter === "favorites") params.set("favorites", "true");
@@ -117,6 +117,9 @@
         <button type="button" class="icon-btn round" id="random" aria-label="Play a random album">${ICONS.shuffle}</button>
         <a class="btn primary" href="#vibe" style="border-radius:22px">Vibe Sesh</a>
       </div>
+      <div class="seg" role="group" aria-label="Show" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+        <button type="button" data-media="audio" aria-pressed="${state.media === "audio"}">Music</button>
+        <button type="button" data-media="video" aria-pressed="${state.media === "video"}">Movies &amp; concerts</button></div>
       <div class="search">${ICONS.search}
         <label class="sr-only" for="q">Search the library</label>
         <input id="q" type="search" placeholder="Artist, album or track" value="${esc(state.q)}" autocomplete="off">
@@ -138,6 +141,11 @@
         <input type="file" id="reimport" accept=".xlsx,.xlsm" class="sr-only"></label>`;
     $("#sort").value = state.sort;
     $("#reimport").addEventListener("change", importCatalog);
+    view.querySelectorAll("[data-media]").forEach((b) => (b.onclick = async () => {
+      state.media = b.dataset.media;
+      view.querySelectorAll("[data-media]").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.media === state.media)));
+      await loadAlbums(); drawGrid();
+    }));
 
     let t;
     $("#q").addEventListener("input", (e) => {
@@ -279,12 +287,19 @@
   }
 
   function drawGrid() {
-    const grid = $("#grid");
+    let grid = $("#grid");
     if (!grid) return;
-    $("#count").textContent = `${state.albums.length} album${state.albums.length === 1 ? "" : "s"}`;
+    if (grid.classList.contains("empty") && state.albums.length) {
+      grid.outerHTML = `<div class="grid" id="grid"></div>`;
+      grid = $("#grid");
+    }
+    const noun = state.media === "video" ? "title" : "album";
+    $("#count").textContent = `${state.albums.length} ${noun}${state.albums.length === 1 ? "" : "s"}`;
     if (!state.albums.length) {
       if (!state.q && state.filter === "all" && $("#reimport-btn")) $("#reimport-btn").hidden = true;
-      grid.outerHTML = state.q || state.filter !== "all"
+      grid.outerHTML = state.media === "video" && !state.q
+        ? `<div class="empty" id="grid"><strong>No movies or concerts yet</strong>Add them in Load discs: scan the case and pick DVD or Blu-ray.</div>`
+        : state.q || state.filter !== "all"
         ? `<div class="empty" id="grid"><strong>No matches</strong>Try another search or filter.</div>`
         : `<div class="empty" id="grid"><strong>Your library is empty</strong>Import CD_Collection.xlsx to load the catalog.
              <div style="margin-top:16px"><label class="btn primary">${ICONS.upload}Import catalog
@@ -547,16 +562,81 @@
     // A barcode that matches exactly one album not loaded yet: load it straight away.
     if (r.kind === "barcode" && r.matches.length === 1 && open.length === 1) return doLoad(open[0].id, r.code);
     if (!r.matches.length) {
-      box.innerHTML = r.kind === "barcode"
-        ? `<div class="warnbox">${r.lookup_failed ? "Couldn't reach MusicBrainz to look up that barcode." : r.release
-            ? `That's <strong>${esc(r.release.title)}</strong> by ${esc(r.release.artist)}${r.release.country ? ` (${esc(r.release.country)}${r.release.date ? ` ${esc(r.release.date.slice(0, 4))}` : ""})` : ""}, which isn't in your library. Add it to the spreadsheet and re-import, then scan again.`
-            : `Barcode ${esc(r.code)} isn't in your library or on MusicBrainz. Try the catalog number, artist or album instead.`}</div>`
-        : `<div class="empty"><strong>No match</strong>Try the barcode, catalog number, artist or album.</div>`;
+      if (r.kind === "barcode" && r.lookup_failed) {
+        box.innerHTML = `<div class="warnbox">Couldn't reach MusicBrainz to look up that barcode. Try again, or add it by hand.</div>${newDiscForm({ barcode: r.code })}`;
+      } else if (r.kind === "barcode") {
+        const rel = r.release;
+        box.innerHTML = `<div class="quiet" style="font-size:13px">${rel
+          ? `That's <strong>${esc(rel.title)}</strong>${rel.artist ? ` by ${esc(rel.artist)}` : ""} (from ${rel.source === "discogs" ? "Discogs" : "MusicBrainz"}). It isn't in your library yet.`
+          : `Barcode ${esc(r.code)} isn't in your library, and the music databases don't know it. Type in what it is.`}</div>
+          ${newDiscForm({ barcode: r.code, ...(rel || {}) })}`;
+      } else {
+        box.innerHTML = `<div class="empty"><strong>No match</strong>Try the barcode, catalog number, artist or album, or add it as a new disc.</div>${newDiscForm({ title: code })}`;
+      }
+      wireNewDisc();
       return;
     }
     box.innerHTML = `${r.kind === "barcode" && r.release ? `<div class="quiet" style="font-size:13px">Barcode is ${esc(r.release.title)} by ${esc(r.release.artist)}. Closest albums in your library:</div>` : ""}
-      ${r.matches.map((m) => matchCard(m, r.kind === "barcode" ? r.code : null)).join("")}`;
+      ${r.matches.map((m) => matchCard(m, r.kind === "barcode" ? r.code : null)).join("")}
+      <details class="card"><summary style="cursor:pointer;font-weight:600;min-height:28px">None of these: add it as a new disc</summary>
+        ${newDiscForm(r.kind === "barcode" ? { barcode: r.code, ...(r.release || {}) } : { title: code })}</details>`;
     box.querySelectorAll("[data-load]").forEach((b) => (b.onclick = () => doLoad(Number(b.dataset.load), b.dataset.code || null)));
+    wireNewDisc();
+  }
+
+  const NEW_FORMATS = ["CD", "SACD", "DVD-Audio", "Blu-ray Audio", "DVD", "Blu-ray", "4K Blu-ray"];
+  const VIDEO_FORMATS = ["DVD", "Blu-ray", "4K Blu-ray"];
+
+  function newDiscForm(p) {
+    const fmt = p.suggested_format || "CD";
+    state.load.newDisc = { source: p.source || null, release_id: p.id || null, cover: p.cover || null };
+    return `<form class="card" id="nd-form" style="display:flex;flex-direction:column;gap:10px;margin-top:8px">
+      <div style="font-weight:600">Add a new disc</div>
+      <div class="field"><label for="nd-format">Format</label><select id="nd-format">${NEW_FORMATS.map((f) => `<option ${f === fmt ? "selected" : ""}>${f}</option>`).join("")}</select></div>
+      <div class="field"><label for="nd-artist" id="nd-artist-l">Artist</label><input id="nd-artist" type="text" value="${esc(p.artist || "")}" autocomplete="off"></div>
+      <div class="field"><label for="nd-title">Title</label><input id="nd-title" type="text" value="${esc(p.title || "")}" autocomplete="off" required></div>
+      <div class="row" style="gap:10px">
+        <div class="field grow"><label for="nd-year">Year</label><input id="nd-year" type="number" inputmode="numeric" min="1900" max="2100" value="${p.year || ""}"></div>
+        <div class="field grow"><label for="nd-discs">Discs</label><input id="nd-discs" type="number" inputmode="numeric" min="1" max="20" value="${p.disc_count || 1}"></div>
+      </div>
+      <div class="field"><label for="nd-catno">Catalog number</label><input id="nd-catno" type="text" value="${esc(p.catno || "")}" autocomplete="off"></div>
+      <input type="hidden" id="nd-barcode" value="${esc(p.barcode || "")}"><input type="hidden" id="nd-label" value="${esc(p.label || "")}">
+      <div class="quiet" style="font-size:12px" id="nd-hint"></div>
+      <button type="submit" class="btn primary">Add and give me a slot</button>
+    </form>`;
+  }
+
+  function wireNewDisc() {
+    const f = $("#nd-form");
+    if (!f) return;
+    const hint = () => {
+      const video = VIDEO_FORMATS.includes($("#nd-format").value);
+      $("#nd-artist-l").textContent = video ? "Artist (leave empty for a movie)" : "Artist";
+      $("#nd-hint").textContent = video ? "Concerts and movies show under Movies & concerts in the library."
+        : "The cover and track list are looked up once it's added.";
+    };
+    $("#nd-format").onchange = hint;
+    hint();
+    f.onsubmit = async (e) => {
+      e.preventDefault();
+      const nd = state.load.newDisc || {};
+      const body = { changer_id: state.load.changer, format: $("#nd-format").value, artist: $("#nd-artist").value,
+        title: $("#nd-title").value, year: Number($("#nd-year").value) || null, discs: Number($("#nd-discs").value) || 1,
+        catno: $("#nd-catno").value, barcode: $("#nd-barcode").value || null, label: $("#nd-label").value || null,
+        source: nd.source, release_id: nd.release_id ? String(nd.release_id) : null, cover: nd.cover };
+      try {
+        const r = await api("onboard/new", { json: body });
+        state.load.last = r;
+        state.load.log.unshift(r);
+        $("#ld-q").value = "";
+        $("#ld-matches").innerHTML = "";
+        drawLoadResult(r);
+        drawLoadLog();
+        drawLoadStatus();
+        toast("Added to your library");
+        $("#ld-q").focus();
+      } catch (err) { toast(err.message); }
+    };
   }
 
   function matchCard(m, code) {
@@ -655,6 +735,35 @@
       try { await api("onboard/skip", { json: { changer_id: state.load.changer, slot: s.next_slot, note: $("#sk-note").value } }); box.innerHTML = ""; toast(`Slot ${s.next_slot} skipped`); drawLoadStatus(); }
       catch (err) { toast(err.message); }
     };
+  }
+
+  // --- slot check: what the changer holds vs. what the library says --------------------
+  async function runAudit(cid, btn) {
+    const box = $(`#audit-${cid}`);
+    box.hidden = false;
+    box.innerHTML = `<div class="set-row"><div class="help">Asking ${esc(changerName(cid))} which slots hold a disc…</div></div>`;
+    if (btn) btn.disabled = true;
+    let r;
+    try { r = await api(`changers/${cid}/audit`); }
+    catch (err) { box.innerHTML = `<div class="set-row"><div class="warnbox">${esc(err.message)}</div></div>`; if (btn) btn.disabled = false; return; }
+    if (btn) btn.disabled = false;
+    const slots = (list) => list.map((x) => x.slot ?? x).join(", ");
+    const missing = r.missing.map((m) => `<div class="list-row" style="font-size:13px"><span style="font-weight:700;min-width:44px">${m.slot}</span>
+      <span class="grow ellipsis">${esc(m.title)} <span class="quiet">· ${esc(m.artist)}</span></span></div>`).join("");
+    box.innerHTML = `<div class="set-row stack" style="gap:8px">
+      <div class="help"><strong>${r.occupied}</strong> slots hold a disc. ${r.matched} match the library${r.unknown.length ? `, <strong>${r.unknown.length}</strong> hold a disc the library doesn't know` : ""}${r.missing.length ? `, <strong>${r.missing.length}</strong> should hold a disc but are empty` : ""}${r.skipped_full.length ? `, ${r.skipped_full.length} skipped slots hold a disc` : ""}.</div>
+      ${r.unknown.length ? `<div><div class="label" style="font-size:14px">Unknown discs</div><div class="help">Slots ${esc(slots(r.unknown))}</div>
+        <button type="button" class="btn" id="au-skip-${cid}" style="margin-top:6px">Skip these ${r.unknown.length} slots while loading</button></div>` : ""}
+      ${r.missing.length ? `<div><div class="label" style="font-size:14px">Empty, but the library says loaded</div>${missing}
+        <div class="help">Put the disc back in its slot, or open the album and change where it is.</div></div>` : ""}
+      ${r.skipped_empty.length ? `<div><div class="label" style="font-size:14px">Skipped slots that are now empty</div><div class="help">Slots ${esc(slots(r.skipped_empty))}</div>
+        <button type="button" class="btn" id="au-clear-${cid}" style="margin-top:6px">Make these ${r.skipped_empty.length} slots usable again</button></div>` : ""}
+      ${!r.unknown.length && !r.missing.length && !r.skipped_empty.length ? `<div class="help" style="color:var(--good)">Everything matches.</div>` : ""}
+    </div>`;
+    const sk = $(`#au-skip-${cid}`);
+    if (sk) sk.onclick = async () => { try { await api(`changers/${cid}/audit/skip`, { json: { slots: r.unknown } }); toast("Slots skipped"); runAudit(cid); } catch (err) { toast(err.message); } };
+    const cl = $(`#au-clear-${cid}`);
+    if (cl) cl.onclick = async () => { try { await api(`changers/${cid}/audit/clear`, { json: { slots: r.skipped_empty } }); toast("Slots cleared"); runAudit(cid); } catch (err) { toast(err.message); } };
   }
 
   // --- liner notes (album sheet) -------------------------------------------------------
@@ -1298,11 +1407,14 @@
           <input type="range" min="50" max="100" step="5" value="${p.full_listen_percent}" id="full-pct" aria-label="Full listen percentage">
         </div>
         <div class="set-row stack">
-          <div><div class="label">Theater script</div>
-            <div class="help">The Home Assistant script that turns on the receiver and TV before an album plays.${s.configured_listen_script ? ` Leave empty to use ${esc(s.configured_listen_script)} from the app configuration.` : " Leave empty to skip it."}</div></div>
-          <form id="script-form" style="display:flex;gap:8px">
-            <input type="text" id="script" value="${esc(p.listen_script)}" placeholder="script.theater_listen" autocomplete="off" autocapitalize="off" spellcheck="false">
-            <button class="btn" type="submit">Save</button>
+          <div><div class="label">Theater scenes</div>
+            <div class="help">When you press Play, Disc Library runs one of these Home Assistant scripts first: Listen for CDs, Watch for movies and concerts. Each gets the receiver input of the changer the disc is in. Leave a script empty to skip it.</div></div>
+          <form id="script-form" style="display:flex;flex-direction:column;gap:8px">
+            <div class="field"><label for="script">Listen script</label><input type="text" id="script" value="${esc(p.listen_script)}" placeholder="script.theater_listen" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+            <div class="field"><label for="wscript">Watch script</label><input type="text" id="wscript" value="${esc(p.watch_script)}" placeholder="script.theater_watch" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+            ${s.changers.map((c) => `<div class="field"><label for="cin-${c.id}">Receiver input for ${esc(c.name)}</label>
+              <input type="text" id="cin-${c.id}" data-cin="${c.id}" value="${esc((p.changer_inputs || {})[String(c.id)] || "")}" placeholder="${c.id === 1 ? "SA-CD/CD" : "VIDEO"}" autocomplete="off" autocapitalize="off" spellcheck="false"></div>`).join("")}
+            <button class="btn" type="submit" style="align-self:flex-start">Save</button>
           </form>
         </div>
       </div>
@@ -1362,8 +1474,13 @@
       <div class="set-group">
         ${s.changers.map((c) => `<div class="set-row"><div class="grow"><div class="label">${esc(c.name)}</div>
           <div class="help">${c.driver === "simulated" ? "Simulated (for testing until the changer is networked)" : `Sony CX7000ES${c.host ? ` at ${esc(c.host)}${c.port ? `:${c.port}` : ""}` : ", no address set"}`}</div></div>
-          <span class="badge ${/^unreachable|missing/.test(c.state) ? "warn" : "good"}">${esc(c.state)}</span></div>`).join("")
+          <span class="badge ${/^unreachable|missing/.test(c.state) ? "warn" : "good"}">${esc(c.state)}</span>
+          ${c.driver === "simulated" ? "" : `<button type="button" class="btn" data-audit="${c.id}">Check slots</button>`}</div>
+          <div id="audit-${c.id}" hidden></div>`).join("")
           || `<div class="set-row"><div class="help">No changers set up.</div></div>`}
+        <div class="set-row"><div class="grow"><div class="label">In Home Assistant</div>
+          <div class="help">Each changer appears as a device with Now playing and Play/Pause, Next, Previous and Stop buttons, through the MQTT broker (Mosquitto).</div></div>
+          <span class="badge ${s.ha_devices ? "good" : "warn"}">${s.ha_devices ? "Connected" : "Not connected"}</span></div>
         <div class="set-row"><div class="help">Changer names and addresses are set in Home Assistant under Settings → Apps → Disc Library → Configuration, and take effect when the app restarts.</div></div>
       </div>
 
@@ -1382,12 +1499,18 @@
     const pct = $("#full-pct");
     pct.oninput = () => { $("#pct").textContent = `${pct.value}%`; };
     pct.onchange = () => save({ full_listen_percent: Number(pct.value) }, `Full listen is now ${pct.value}%`);
-    $("#script-form").onsubmit = (e) => { e.preventDefault(); save({ listen_script: $("#script").value.trim() }, "Theater script saved"); };
+    $("#script-form").onsubmit = (e) => {
+      e.preventDefault();
+      const inputs = {};
+      view.querySelectorAll("[data-cin]").forEach((el) => { inputs[el.dataset.cin] = el.value.trim(); });
+      save({ listen_script: $("#script").value.trim(), watch_script: $("#wscript").value.trim(), changer_inputs: inputs }, "Theater scenes saved");
+    };
     view.querySelectorAll("[data-pref]").forEach((el) => (el.onchange = () => save({ [el.dataset.pref]: el.checked })));
     if ($("#sync-go")) $("#sync-go").onclick = async () => { await api("enrich/start", { method: "POST" }); renderSettings(); };
     if ($("#sync-retry")) $("#sync-retry").onclick = async () => { await api("enrich/start?retry=true", { method: "POST" }); renderSettings(); };
     if ($("#sync-stop")) $("#sync-stop").onclick = async () => { await api("enrich/stop", { method: "POST" }); renderSettings(); };
     $("#set-import").addEventListener("change", importCatalog);
+    view.querySelectorAll("[data-audit]").forEach((b) => (b.onclick = () => runAudit(Number(b.dataset.audit), b)));
     renderStorage();
     drawRemoved();
     drawDiscogs(s);
