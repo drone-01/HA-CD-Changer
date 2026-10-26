@@ -57,10 +57,16 @@ def test_remove_restore_and_reimport(db, workbook):
     lib.set_location(disc_id(db, "Dirt"), "changer", 1, 3)
 
     out = lib.remove(dirt)
-    assert out["removed_at"] and out["slots"] == []
+    assert out["removed_at"] and [(d["changer_id"], d["slot"]) for d in out["slots"]] == [(1, 3)]
     assert "Dirt" not in [a["title"] for a in lib.albums()]
-    assert lib.free_slot(1) == {"changer_id": 1, "slot": 1}
     assert [r["title"] for r in lib.removed()] == ["Dirt"]
+    # the slot stays blocked until the disc is pulled
+    assert [(p["changer_id"], p["slot"]) for p in lib.to_pull()] == [(1, 3)]
+    lib.set_location(disc_id(db, "Nevermind"), "changer", 1, 1)
+    lib.set_location(disc_id(db, "The Downward Spiral"), "changer", 1, 2)
+    assert lib.free_slot(1) == {"changer_id": 1, "slot": 4}
+    lib.mark_pulled([p["disc_id"] for p in lib.to_pull()])
+    assert lib.to_pull() == [] and lib.free_slot(1) == {"changer_id": 1, "slot": 3}
 
     r = import_workbook(db, workbook)  # stays removed
     assert r["skipped_removed"] == 1
@@ -77,6 +83,11 @@ def test_restore_when_old_slot_was_reused(db, workbook):
     lib = Library(db, [1, 2])
     lib.set_location(disc_id(db, "Dirt"), "changer", 1, 3)
     lib.remove(album_id(db, "Dirt"))
+    import pytest
+    from app.library import LocationError
+    with pytest.raises(LocationError):  # still physically there
+        lib.set_location(disc_id(db, "Nevermind"), "changer", 1, 3)
+    lib.mark_pulled([p["disc_id"] for p in lib.to_pull()])
     lib.set_location(disc_id(db, "Nevermind"), "changer", 1, 3)
     assert lib.restore(album_id(db, "Dirt"))["back_in_slot"] == []
     assert lib.album(album_id(db, "Dirt"))["location_type"] == "unassigned"
@@ -93,3 +104,12 @@ def test_collection_counts(db, workbook):
     assert c["formats"]["CD"] == 3 and c["formats"]["SACD"] == 1 and c["formats"]["Blu-ray"] == 2
     assert c["changers"][0] == {"id": 1, "name": "Upstairs", "used": 1, "capacity": 400}
     assert c["not_in_changer"] == 5 and c["runtime_sec"] == 3000
+
+
+def test_restore_before_pulling_keeps_the_slot(db, workbook):
+    import_workbook(db, workbook)
+    lib = Library(db, [1, 2])
+    lib.set_location(disc_id(db, "Dirt"), "changer", 2, 9)
+    lib.remove(album_id(db, "Dirt"))
+    assert lib.restore(album_id(db, "Dirt"))["back_in_slot"] == [{"changer_id": 2, "slot": 9}]
+    assert lib.to_pull() == []

@@ -21,7 +21,7 @@
   const ART_COLORS = ["#5A4E3B", "#4A4A3B", "#3B4A5A", "#5A3B4D", "#3B5A55", "#5A3B3B", "#3F3B5A", "#4D5A3B"];
 
   const state = {
-    q: "", filter: "all", sort: "artist", albums: [], genres: [], changers: [], prefs: {},
+    q: "", filter: "all", sort: "artist", albums: [], genres: [], changers: [], prefs: {}, decade: "", decades: [],
     vibe: { mood: "Brooding", energy: "High", time_budget: "about_hour", familiarity: "rediscover" },
     vibePicks: null, statsRange: "year", now: { playing: false },
   };
@@ -70,7 +70,8 @@
     return `<div class="art ${size}" style="background:${bg}">${inner}</div>`;
   }
   const initials = (t = "") => t.replace(/[^\p{L}\p{N} ]/gu, "").split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join("").toUpperCase();
-  const where = (a) => a.location_type === "changer" ? `C${a.changer_id}·${a.slot}` : "";
+  const where = (a) => a.location_type === "changer"
+    ? `C${a.changer_id}·${a.slot}${a.disc_count > 1 ? ` +${a.disc_count - 1}` : ""}` : (a.disc_count > 1 ? `${a.disc_count} discs` : "");
   const changerName = (id) => (state.changers.find((c) => c.id === id) || {}).name || `Changer ${id}`;
 
   function describeLocation(a) {
@@ -84,7 +85,7 @@
   }
 
   // --- routing -----------------------------------------------------------------
-  const routes = { library: renderLibrary, vibe: renderVibe, playing: renderPlaying, stats: renderStats, settings: renderSettings, pressings: () => renderPressings() };
+  const routes = { library: renderLibrary, vibe: renderVibe, playing: renderPlaying, stats: renderStats, settings: renderSettings, pressings: () => renderPressings(), pull: renderPull };
   function route() {
     const name = (location.hash || "#library").slice(1);
     const fn = routes[name] || renderLibrary;
@@ -102,6 +103,7 @@
   async function loadAlbums() {
     const params = new URLSearchParams({ sort: state.sort });
     if (state.q) params.set("q", state.q);
+    if (state.decade) params.set("decade", state.decade);
     if (state.filter === "favorites") params.set("favorites", "true");
     else if (state.filter !== "all") params.set("genre", state.filter);
     state.albums = await api(`albums?${params}`);
@@ -122,6 +124,8 @@
       <div id="enrich"></div>
       <div id="continue"></div>
       <div class="row"><h2 class="grow" id="count">Albums</h2>
+        <label class="sr-only" for="decade">Decade</label>
+        <select id="decade" class="btn ghost" style="min-height:36px;padding:0 10px;font-size:14px"><option value="">All years</option></select>
         <label class="sr-only" for="sort">Sort</label>
         <select id="sort" class="btn ghost" style="min-height:36px;padding:0 10px;font-size:14px">
           <option value="artist">Artist A–Z</option><option value="title">Title</option>
@@ -140,13 +144,23 @@
       t = setTimeout(async () => { state.q = e.target.value.trim(); await loadAlbums(); drawGrid(); }, 200);
     });
     $("#sort").addEventListener("change", async (e) => { state.sort = e.target.value; await loadAlbums(); drawGrid(); });
+    $("#decade").addEventListener("change", async (e) => { state.decade = e.target.value; await loadAlbums(); drawGrid(); });
     $("#random").addEventListener("click", async () => {
-      try { await api("random", { method: "POST" }); await refreshNow(); location.hash = "#playing"; }
+      // Random respects whatever is filtered: genre, favorites and decade.
+      const params = new URLSearchParams();
+      if (state.decade) params.set("decade", state.decade);
+      if (state.filter === "favorites") params.set("favorites", "true");
+      else if (state.filter !== "all") params.set("genre", state.filter);
+      try { await api(`random?${params}`, { method: "POST" }); await refreshNow(); location.hash = "#playing"; }
       catch (err) { toast(err.message); }
     });
 
     try {
-      [state.genres, state.changers, state.prefs] = await Promise.all([api("genres"), api("changers"), api("prefs").catch(() => ({}))]);
+      [state.genres, state.changers, state.prefs, state.decades] = await Promise.all([api("genres"), api("changers"),
+        api("prefs").catch(() => ({})), api("decades").catch(() => [])]);
+      $("#decade").innerHTML = `<option value="">All years</option>` + state.decades.map((d) =>
+        `<option value="${d.decade}">${d.decade}s (${d.albums})</option>`).join("");
+      $("#decade").value = state.decade;
       await loadAlbums();
     } catch (err) { toast(err.message); }
     drawChips();
@@ -161,19 +175,36 @@
     clearTimeout(enrichTimer);
     const box = $("#enrich");
     if (!box) return;
-    let e, p;
-    try { [e, p] = await Promise.all([api("enrich"), api("pressings?filter=none").catch(() => null)]); } catch { return; }
+    let e, p, pull;
+    try { [e, p, pull] = await Promise.all([api("enrich"), api("pressings?filter=none").catch(() => null), api("to-pull").catch(() => [])]); } catch { return; }
     const { job, counts } = e;
     const pending = counts.pending || 0;
     const missed = (counts.not_found || 0) + (counts.error || 0);
+    const extra = [];
+    if (pull.length) {
+      extra.push(`<a class="card link" href="#pull" style="border:1px solid var(--danger)">
+        <div class="grow"><div style="font-weight:600">Pull ${pull.length} disc${pull.length === 1 ? "" : "s"} from the changers</div>
+        <div class="quiet" style="font-size:13px">Removed albums. Their slots stay reserved until you mark them pulled.</div></div>
+        <span style="color:var(--danger);font-weight:700">Open</span></a>`);
+    }
+    if (p) {
+      const c = p.counts, todo = (c.review || 0) + (c.catalog || 0) + (c.unmatched || 0) - pending;
+      if (todo > 0 || c.locked) {
+        extra.push(`<a class="card link" href="#pressings">
+          <div class="grow"><div style="font-weight:600">Verify pressings</div>
+          <div class="quiet" style="font-size:13px">${c.locked} locked · ${c.catalog} ready to lock · ${c.review} to review${missed ? ` · ${missed} unmatched` : ""}</div></div>
+          <span style="color:var(--accent);font-weight:700">Open</span></a>`);
+      }
+    }
     if (job.running) {
       const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
+      box.style.cssText = "display:flex;flex-direction:column;gap:10px";
       box.innerHTML = `<div class="card" style="display:flex;flex-direction:column;gap:8px">
         <div class="row"><strong class="grow" style="font-size:14px">Fetching covers and album details</strong>
           <span class="quiet" style="font-size:13px">${job.done} of ${job.total}</span>
           <button type="button" class="btn ghost" id="enrich-stop" style="min-height:32px;font-size:13px;padding:0 10px">Stop</button></div>
         <div class="bar"><span style="width:${pct}%"></span></div>
-        <div class="quiet ellipsis" style="font-size:12px">${esc(job.current || "")}</div></div>`;
+        <div class="quiet ellipsis" style="font-size:12px">${esc(job.current || "")}</div></div>${extra.join("")}`;
       $("#enrich-stop").onclick = async () => { await api("enrich/stop", { method: "POST" }); drawEnrich(); };
       enrichTimer = setTimeout(async () => {
         if (!$("#enrich")) return;
@@ -194,15 +225,7 @@
         <div class="quiet" style="font-size:13px">${pending} album${pending === 1 ? "" : "s"} still need art, track lists and genres</div></div>
         <span style="color:var(--accent);font-weight:700">Start</span></button>`);
     }
-    if (p) {
-      const c = p.counts, todo = (c.review || 0) + (c.catalog || 0) + (c.unmatched || 0) - pending;
-      if (todo > 0 || c.locked) {
-        parts.push(`<a class="card link" href="#pressings">
-          <div class="grow"><div style="font-weight:600">Verify pressings</div>
-          <div class="quiet" style="font-size:13px">${c.locked} locked · ${c.catalog} ready to lock · ${c.review} to review${missed ? ` · ${missed} unmatched` : ""}</div></div>
-          <span style="color:var(--accent);font-weight:700">Open</span></a>`);
-      }
-    }
+    parts.push(...extra);
     box.innerHTML = parts.join("");
     box.style.display = parts.length ? "flex" : "";
     box.style.flexDirection = "column";
@@ -298,7 +321,7 @@
     const fmtLen = (sec) => sec ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}` : "";
     const statusText = {
       matched: `Matched on MusicBrainz (${a.enrich_note || "artist and title"})`,
-      manual: "Matched by hand",
+      manual: a.mbid_release ? "Matched by hand" : "Not on MusicBrainz; locked with the numbers you typed",
       not_found: `Not matched yet: ${a.enrich_note || "no confident match"}`,
       error: `Lookup failed: ${a.enrich_note || ""}`,
       skipped: `Skipped: ${a.enrich_note || ""}`,
@@ -326,11 +349,16 @@
           <button type="button" class="icon-btn round" id="fav" aria-pressed="${!!a.favorite}" aria-label="Favorite">
             ${ICONS.heart.replace("<svg", `<svg style="${a.favorite ? "fill:var(--accent);stroke:var(--accent)" : ""}"`)}</button>
         </div>
-        ${a.tracks.length ? `<ol class="tracklist">${a.tracks.map((t) => `<li><span class="n">${t.number}</span><span class="grow ellipsis">${esc(t.title || "")}</span><span class="quiet" style="font-size:13px">${fmtLen(t.duration_sec)}</span></li>`).join("")}</ol>` : ""}
+        ${a.discs.length > 1 ? discsCard(a) : ""}
+        ${a.tracks.length ? [...new Set(a.tracks.map((t) => t.disc_number))].map((dn) => `
+          ${a.discs.length > 1 ? `<h2>Disc ${dn}</h2>` : ""}
+          <ol class="tracklist">${a.tracks.filter((t) => t.disc_number === dn).map((t) => `<li><span class="n">${t.number}</span><span class="grow ellipsis">${esc(t.title || "")}</span><span class="quiet" style="font-size:13px">${fmtLen(t.duration_sec)}</span></li>`).join("")}</ol>`).join("") : ""}
         ${moneyCard(a)}
         ${pressingCard(a, statusText)}
         <form id="loc" class="card" style="display:flex;flex-direction:column;gap:10px">
-          <h2>Where is this disc?</h2>
+          <h2>${a.discs.length > 1 ? "Where are these discs?" : "Where is this disc?"}</h2>
+          ${a.discs.length > 1 ? `<div class="field"><label for="loc-disc">Disc</label>
+            <select id="loc-disc">${a.discs.map((d) => `<option value="${d.id}">Disc ${d.disc_number}</option>`).join("")}</select></div>` : ""}
           <div class="field"><label for="loc-type">Location</label>
             <select id="loc-type">
               <option value="changer">In a changer</option><option value="shelf">On the shelf</option>
@@ -350,14 +378,22 @@
             <button type="submit" class="btn grow">Save location</button>
           </div>
         </form>
+        ${linkCard(a)}
         ${loanPreview()}
         <div id="remove-box"><button type="button" class="btn danger block" id="remove">Remove from library</button></div>
       </div>`;
-    const disc = a.discs[0];
-    $("#loc-type").value = a.location_type || "unassigned";
-    if (a.changer_id) $("#loc-changer").value = a.changer_id;
-    if (a.slot) $("#loc-slot").value = a.slot;
-    $("#loc-note").value = a.location_note || "";
+    let disc = a.discs[0];
+    const fillLoc = (d) => {
+      $("#loc-type").value = d.location_type === "to_pull" ? "unassigned" : (d.location_type || "unassigned");
+      if (d.changer_id) $("#loc-changer").value = d.changer_id;
+      $("#loc-slot").value = d.slot || "";
+      $("#loc-note").value = d.location_note || "";
+    };
+    fillLoc(disc);
+    if ($("#loc-disc")) $("#loc-disc").onchange = () => {
+      disc = a.discs.find((d) => d.id === Number($("#loc-disc").value));
+      fillLoc(disc); syncFields();
+    };
     const syncFields = () => {
       const isChanger = $("#loc-type").value === "changer";
       $("#loc-changer-fields").hidden = !isChanger;
@@ -388,6 +424,11 @@
     };
     bindPressingCard(a);
     bindMoneyCard(a);
+    bindLinkCard(a);
+    sheet.querySelectorAll("[data-play-disc]").forEach((b) => (b.onclick = () => play(a.id, 1, Number(b.dataset.playDisc))));
+    sheet.querySelectorAll("[data-edit-disc]").forEach((b) => (b.onclick = () => {
+      $("#loc-disc").value = b.dataset.editDisc; $("#loc-disc").onchange(); $("#loc").scrollIntoView({ block: "center", behavior: "smooth" });
+    }));
     $("#remove").onclick = () => confirmRemove(a);
     $("#close").onclick = () => sheet.close();
     $("#play").onclick = () => play(a.id);
@@ -401,11 +442,139 @@
   sheet.addEventListener("click", (e) => { if (e.target === sheet) sheet.close(); });
 
 
+  // --- multi-disc sets (album sheet) -----------------------------------------------
+  function discsCard(a) {
+    const loc = (d) => d.location_type === "changer" ? `${esc(changerName(d.changer_id))} · slot ${d.slot}`
+      : d.location_type === "to_pull" ? "Waiting to be pulled" : esc(describeLocation(d));
+    return `<div class="card" style="display:flex;flex-direction:column;gap:4px">
+      <h2>${a.discs.length} discs</h2>
+      ${a.discs.map((d) => `<div class="list-row" style="font-size:14px">
+        <span style="font-weight:700;width:52px">Disc ${d.disc_number}</span>
+        <span class="grow ${d.location_type === "changer" ? "" : "quiet"}">${loc(d)}</span>
+        ${d.location_type === "changer" && d.disc_number !== a.discs[0].disc_number ? `<button type="button" class="btn ghost" data-play-disc="${d.disc_number}" style="min-height:32px;font-size:13px;padding:0 10px">Play</button>` : ""}
+        <button type="button" class="btn ghost" data-edit-disc="${d.id}" style="min-height:32px;font-size:13px;padding:0 10px">Move</button>
+      </div>`).join("")}
+      <div class="quiet" style="font-size:12px">Plays straight through, switching changers if the discs are on different ones.</div>
+    </div>`;
+  }
+
+  function linkCard(a) {
+    return `<details class="card" id="link-card">
+      <summary style="cursor:pointer;font-weight:600;min-height:28px">${a.discs.length > 1 ? "Discs in this set" : "Part of a multi-disc set?"}</summary>
+      <div style="display:flex;flex-direction:column;gap:10px;margin-top:10px">
+        <div class="quiet" style="font-size:13px">If another album in your library is really another disc of this one, link it here. It becomes one album with several discs.</div>
+        <div class="row" style="align-items:flex-end">
+          <div class="field grow"><label for="link-other">Album to add</label><select id="link-other"><option value="">Loading…</option></select></div>
+          <div class="field" style="width:90px"><label for="link-n">As disc</label>
+            <input id="link-n" type="number" inputmode="numeric" min="1" max="20" value="${Math.max(0, ...a.discs.map((d) => d.disc_number)) + 1}"></div>
+        </div>
+        <div class="form-error" id="link-err" role="alert"></div>
+        <button type="button" class="btn" id="link-go">Link as one album</button>
+        ${a.discs.length > 1 ? `<div class="quiet" style="font-size:13px;margin-top:4px">Split a disc back into its own album:</div>
+          <div class="row" style="flex-wrap:wrap;gap:8px">${a.discs.map((d) => `<button type="button" class="btn ghost" data-unlink="${d.id}" style="min-height:36px">Split off disc ${d.disc_number}</button>`).join("")}</div>` : ""}
+      </div></details>`;
+  }
+  function bindLinkCard(a) {
+    const card = $("#link-card");
+    card.addEventListener("toggle", async () => {
+      if (!card.open || card.dataset.loaded) return;
+      card.dataset.loaded = "1";
+      const cands = await api(`albums/${a.id}/link-candidates`).catch(() => []);
+      $("#link-other").innerHTML = `<option value="">Pick an album…</option>` + cands.map((c) =>
+        `<option value="${c.id}">${esc(c.artist)} — ${esc(c.title)}${c.catalog_no ? ` (${esc(c.catalog_no)})` : ""}</option>`).join("");
+    });
+    $("#link-go").onclick = async () => {
+      const other = Number($("#link-other").value);
+      if (!other) { $("#link-err").textContent = "Pick the album to add."; return; }
+      try {
+        await api(`albums/${a.id}/link`, { json: { other_id: other, as_disc: Number($("#link-n").value) } });
+        toast("Linked into one album");
+        openAlbum(a.id);
+        if ((location.hash || "#library") === "#library") { await loadAlbums(); drawGrid(); }
+      } catch (err) { $("#link-err").textContent = err.message; }
+    };
+    card.querySelectorAll("[data-unlink]").forEach((b) => (b.onclick = async () => {
+      try {
+        await api(`discs/${b.dataset.unlink}/unlink`, { method: "POST" });
+        toast("Split into its own album");
+        openAlbum(a.id);
+        if ((location.hash || "#library") === "#library") { await loadAlbums(); drawGrid(); }
+      } catch (err) { $("#link-err").textContent = err.message; }
+    }));
+  }
+
+  // --- discs to pull -----------------------------------------------------------------
+  async function renderPull() {
+    const rows = await api("to-pull").catch(() => []);
+    view.innerHTML = `
+      <a href="#library" class="btn ghost" style="align-self:flex-start;border:0;padding:0;color:var(--accent)">‹ Library</a>
+      <div><h1>Discs to pull</h1><p class="sub">These albums were removed. Take each disc out, then mark it pulled so its slot can be used again.</p></div>
+      ${rows.length ? `<div>${rows.map((r) => `<div class="list-row">${art({ id: r.album_id, title: r.title, art_url: r.art_url }, "sm")}
+          <div class="grow" style="min-width:0"><div style="font-weight:700">${esc(changerName(r.changer_id))} · slot ${r.slot}</div>
+            <div class="quiet ellipsis" style="font-size:13px">${esc(r.title)}${r.disc_count > 1 ? ` · disc ${r.disc_number}` : ""} · ${esc(r.artist)}</div></div>
+          <button type="button" class="btn" data-pulled="${r.disc_id}" style="min-height:36px">Pulled</button></div>`).join("")}</div>
+        <button type="button" class="btn primary" id="all-pulled">Mark all ${rows.length} pulled</button>`
+      : `<div class="empty"><strong>Nothing to pull</strong>Every removed disc is out of the changers.</div>`}`;
+    if (!state.changers.length) state.changers = await api("changers").catch(() => []);
+    const mark = async (ids) => {
+      try { await api("to-pull/pulled", { json: { disc_ids: ids } }); toast(ids.length === 1 ? "Slot freed" : `${ids.length} slots freed`); renderPull(); }
+      catch (err) { toast(err.message); }
+    };
+    view.querySelectorAll("[data-pulled]").forEach((b) => (b.onclick = () => mark([Number(b.dataset.pulled)])));
+    if ($("#all-pulled")) $("#all-pulled").onclick = () => mark(rows.map((r) => r.disc_id));
+  }
+
+  // --- Discogs (settings) -------------------------------------------------------------
+  async function drawDiscogs(s) {
+    const box = $("#discogs-box");
+    if (!box) return;
+    const p = s.prefs;
+    if (!p.has_discogs_token) {
+      box.innerHTML = `<div class="set-row stack">
+        <div><div class="label">Connect Discogs</div>
+          <div class="help">On discogs.com: Settings → Developers → Generate new token. Copy it and paste it here. It stays on your Home Assistant and is never shown again.</div></div>
+        <form id="dg-form" style="display:flex;gap:8px">
+          <input type="password" id="dg-token" placeholder="Discogs token" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <button class="btn primary" type="submit">Connect</button></form>
+        <div class="form-error" id="dg-err" role="alert"></div></div>`;
+      $("#dg-form").onsubmit = async (e) => {
+        e.preventDefault();
+        $("#dg-err").textContent = "Checking with Discogs…";
+        try { const r = await api("discogs/connect", { json: { token: $("#dg-token").value.trim() } }); toast(`Connected as ${r.user}. Pricing your albums now.`); renderSettings(); }
+        catch (err) { $("#dg-err").textContent = err.message; }
+      };
+      return;
+    }
+    let v;
+    try { v = await api("values"); } catch (err) { box.innerHTML = `<div class="set-row"><div class="help">${esc(err.message)}</div></div>`; return; }
+    const j = v.job, c = v.counts;
+    const status = j.running ? `Pricing ${j.done} of ${j.total}${j.current ? ` · ${esc(j.current)}` : ""}`
+      : `${c.discogs} priced from Discogs${c.manual ? ` · ${c.manual} typed in` : ""}${c.not_found ? ` · ${c.not_found} not found` : ""}${c.last_updated ? ` · last ${esc(c.last_updated.slice(0, 10))}` : ""}`;
+    box.innerHTML = `<div class="set-row"><div class="grow"><div class="label">Discogs</div><div class="help">Connected as ${esc(p.discogs_user || "your account")} · refreshes every 30 days</div></div>
+        <button type="button" class="btn ghost" id="dg-off" style="min-height:36px">Disconnect</button></div>
+      <div class="set-row stack"><div><div class="label">Prices</div><div class="help" id="dg-status">${status}</div>
+          ${j.stopped_reason ? `<div class="form-error">${esc(j.stopped_reason)}</div>` : ""}
+          ${j.notice ? `<div class="help" style="color:var(--accent)">${esc(j.notice)}</div>` : ""}</div>
+        <div class="set-actions">${j.running ? `<button type="button" class="btn" id="dg-stop">Stop</button>`
+          : `<button type="button" class="btn primary" id="dg-go">${c.due ? `Price ${c.due} albums` : "Update all prices"}</button>`}</div></div>
+      <details class="set-row" style="display:block"><summary class="help" style="cursor:pointer;min-height:28px">Condition: ${esc(p.discogs_condition)}</summary>
+        <select id="dg-cond" style="margin-top:8px;min-height:40px;border-radius:10px;background:var(--panel-2);color:var(--ink);border:1px solid var(--line);padding:0 10px;font-size:16px">
+          ${s.conditions.map((x) => `<option ${x === p.discogs_condition ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></details>`;
+    $("#dg-off").onclick = async () => { await api("discogs/disconnect", { method: "POST" }); renderSettings(); };
+    if ($("#dg-go")) $("#dg-go").onclick = async () => { await api(`values/start?force=${c.due ? "false" : "true"}`, { method: "POST" }); drawDiscogs(s); };
+    if ($("#dg-stop")) $("#dg-stop").onclick = async () => { await api("values/stop", { method: "POST" }); drawDiscogs(s); };
+    $("#dg-cond").onchange = async () => {
+      try { await api("settings", { method: "PUT", json: { discogs_condition: $("#dg-cond").value } }); toast("Condition saved. Use Update all prices to re-price."); renderSettings(); }
+      catch (err) { toast(err.message); }
+    };
+    if (j.running) setTimeout(() => { if ($("#discogs-box") && location.hash === "#settings") drawDiscogs(s); }, 4000);
+  }
+
   // --- value card (album sheet) ----------------------------------------------------
   function moneyCard(a) {
     const perListen = a.paid != null && a.full_listens ? money(a.paid / a.full_listens) : "";
-    const valueSrc = a.value == null ? "Not priced yet" : a.value_source === "discogs"
-      ? `Discogs${a.value_at ? `, ${esc(a.value_at.slice(0, 10))}` : ""}` : "Typed in";
+    const valueSrc = a.value == null ? (a.value_basis === "not found" ? "Not found on Discogs" : "Not priced yet")
+      : a.value_source === "discogs" ? `Discogs ${esc(a.value_basis || "")}${a.value_at ? `, ${esc(a.value_at.slice(0, 10))}` : ""}` : "Typed in";
     const paidSrc = a.paid == null ? "Not recorded" : a.paid_source === "notes" ? "From your spreadsheet notes" : "Typed in";
     return `<div class="card" id="money" style="display:flex;flex-direction:column;gap:12px">
       <div class="row"><h2 class="grow">Value</h2>${a.value != null ? `<span class="tier">${tierOf(a.value)}</span>` : ""}
@@ -415,12 +584,15 @@
         <div><div class="amt">${a.paid != null ? money(a.paid) : "—"}</div><div class="src">You paid · ${paidSrc}</div></div>
       </div>
       ${perListen ? `<div class="quiet" style="font-size:13px">${perListen} per full listen so far</div>` : ""}
+      ${state.prefs.has_discogs_token && a.value_source !== "manual" ? `<div class="row" style="gap:8px">
+        ${a.discogs_release ? `<a href="https://www.discogs.com/release/${esc(a.discogs_release)}" target="_blank" rel="noopener" style="font-size:13px">Discogs release</a>` : ""}
+        <span class="grow"></span><button type="button" class="btn ghost" id="money-refresh" style="min-height:32px;font-size:13px;padding:0 10px">Look up again</button></div>` : ""}
       <form id="money-form" hidden style="display:flex;flex-direction:column;gap:10px">
         <div class="row">
           <div class="field grow"><label for="m-value">Market value ($)</label><input id="m-value" type="text" inputmode="decimal" value="${a.value ?? ""}" placeholder="e.g. 12.50"></div>
           <div class="field grow"><label for="m-paid">You paid ($)</label><input id="m-paid" type="text" inputmode="decimal" value="${a.paid ?? ""}" placeholder="e.g. 9.99"></div>
         </div>
-        <div class="quiet" style="font-size:12px">Leave a box empty to clear it. Discogs prices will fill in market value once it's connected.</div>
+        <div class="quiet" style="font-size:12px">Leave market value empty to let Discogs price it again.</div>
         <div class="form-error" id="m-err" role="alert"></div>
         <div class="row"><button type="button" class="btn ghost grow" id="m-cancel">Cancel</button><button type="submit" class="btn primary grow">Save</button></div>
       </form>
@@ -430,6 +602,11 @@
     const form = $("#money-form");
     $("#money-edit").onclick = () => { form.hidden = false; $("#money-edit").hidden = true; $("#m-value").focus(); };
     $("#m-cancel").onclick = () => { form.hidden = true; $("#money-edit").hidden = false; };
+    if ($("#money-refresh")) $("#money-refresh").onclick = async () => {
+      $("#money-refresh").disabled = true; $("#money-refresh").textContent = "Looking up…";
+      try { await api(`albums/${a.id}/value/refresh`, { method: "POST" }); openAlbum(a.id); }
+      catch (err) { toast(err.message); $("#money-refresh").disabled = false; $("#money-refresh").textContent = "Look up again"; }
+    };
     form.onsubmit = async (e) => {
       e.preventDefault();
       try {
@@ -460,7 +637,11 @@
     try { p = await api(`albums/${a.id}/remove-preview`); } catch (err) { return toast(err.message); }
     const lines = [];
     if (p.discs.length > 1) lines.push(`All ${p.discs.length} discs of this set are removed together.`);
-    p.slots.forEach((d) => lines.push(`Frees ${esc(changerName(d.changer_id))} slot ${d.slot}.`));
+    if (p.slots.length) {
+      lines.push(`Pull ${p.slots.length === 1 ? "this disc" : `these ${p.slots.length} discs`} out of the changer${p.slots.length > 1 ? "s" : ""}:
+        <strong>${p.slots.map((d) => `${p.discs.length > 1 ? `Disc ${d.disc_number} — ` : ""}${esc(changerName(d.changer_id))} slot ${d.slot}`).join("; ")}</strong>.
+        ${p.slots.length === 1 ? "Its slot stays" : "Their slots stay"} reserved until you mark ${p.slots.length === 1 ? "it" : "them"} pulled.`);
+    }
     if (p.listens) lines.push(`Its ${p.listens} listen${p.listens === 1 ? "" : "s"} stop counting in Stats.`);
     lines.push("Re-importing the spreadsheet won't bring it back.");
     lines.push("You can restore it any time from Settings → Removed albums.");
@@ -498,6 +679,7 @@
     return !catParts(mine).some((c) => rel.has(c));
   }
   function pressingBadge(a) {
+    if (a.pressing_locked && !a.mbid_release) return `<span class="badge good">Locked as typed</span>`;
     if (a.pressing_locked) return `<span class="badge good">Locked</span>`;
     if (a.match_method === "catalog") return `<span class="badge">Catalog match</span>`;
     if (["matched", "manual"].includes(a.enrich_status)) return `<span class="badge warn">Check this</span>`;
@@ -535,7 +717,9 @@
           <div class="field grow"><label for="p-cat">Catalog number</label><input id="p-cat" type="text" autocomplete="off" value="${esc(mine || "")}"></div>
           <div class="field grow"><label for="p-bc">Barcode</label><input id="p-bc" type="text" inputmode="numeric" autocomplete="off" value="${esc(a.barcode || "")}"></div>
         </div>
-        <button type="submit" class="btn">Search MusicBrainz</button>
+        <div class="row"><button type="submit" class="btn grow">Search MusicBrainz</button>
+          <button type="button" class="btn ghost grow" id="p-manual">Save &amp; lock as typed</button></div>
+        <div class="quiet" style="font-size:12px">No match on MusicBrainz? “Save &amp; lock as typed” keeps your catalog number and barcode and locks the album without a release.</div>
         <div class="form-error" id="p-err" role="alert"></div>
         <div id="p-results" style="display:flex;flex-direction:column;gap:10px"></div>
         <details><summary class="quiet" style="font-size:13px;cursor:pointer;min-height:28px">Paste a MusicBrainz link instead</summary>
@@ -570,6 +754,12 @@
     if ($("#p-unlock")) $("#p-unlock").onclick = async () => { await api(`albums/${a.id}/unlock`, { method: "POST" }); after("Unlocked"); };
     $("#p-change").onclick = () => { $("#p-form").hidden = !$("#p-form").hidden; if (!$("#p-form").hidden) $("#p-cat").focus(); };
     $("#p-link-lock").onclick = () => lock($("#p-link").value.trim());
+    $("#p-manual").onclick = async () => {
+      try {
+        await api(`albums/${a.id}/lock-manual`, { json: { catalog_no: $("#p-cat").value.trim() || null, barcode: $("#p-bc").value.trim() || null } });
+        after("Saved and locked");
+      } catch (err) { $("#p-err").textContent = err.message; }
+    };
     $("#p-form").onsubmit = async (e) => {
       e.preventDefault();
       const params = new URLSearchParams();
@@ -579,7 +769,7 @@
       $("#p-results").innerHTML = "";
       let list;
       try { list = await api(`albums/${a.id}/pressings?${params}`); } catch (err) { $("#p-err").textContent = err.message; return; }
-      $("#p-err").textContent = list.length ? "" : "Nothing found. Check the number, or try the barcode.";
+      $("#p-err").textContent = list.length ? "" : "Nothing on MusicBrainz. Check the number, try the barcode, or use “Save & lock as typed”.";
       $("#p-results").innerHTML = list.slice(0, 15).map((r) => `
         <div class="cand">
           <div style="font-weight:600">${releaseLine(r) || esc(r.title)}</div>
@@ -642,9 +832,9 @@
     };
   }
 
-  async function play(albumId, fromTrack = 1) {
+  async function play(albumId, fromTrack = 1, disc = null) {
     try {
-      await api("play", { json: { album_id: albumId, from_track: fromTrack } });
+      await api("play", { json: { album_id: albumId, from_track: fromTrack, disc } });
       if (sheet.open) sheet.close();
       await refreshNow();
       location.hash = "#playing";
@@ -758,12 +948,13 @@
       return;
     }
     const a = n.album;
+    if (n.disc_count > 1) n.tracks = n.tracks.filter((t) => t.disc_number === n.disc_number);
     const paused = n.status.state === "paused";
     const pct = n.track_count ? Math.round(((n.track - 1) / n.track_count) * 100) : 0;
     view.innerHTML = `
       <div class="row">
         <a href="#library" class="icon-btn" aria-label="Back to library" style="color:var(--ink)">${ICONS.down}</a>
-        <div class="grow" style="text-align:center"><h2 style="font-size:12px">${esc(n.changer.name)} · slot ${n.changer.slot}</h2></div>
+        <div class="grow" style="text-align:center"><h2 style="font-size:12px">${n.disc_count > 1 ? `Disc ${n.disc_number} of ${n.disc_count} · ` : ""}${esc(n.changer.name)} · slot ${n.changer.slot}</h2></div>
         <span class="status-chip"><span class="dot"></span>${paused ? "Paused" : "Playing"}</span>
       </div>
       ${art(a, "lg")}
@@ -904,8 +1095,7 @@
       <div class="set-group">
         <div class="set-row"><div class="grow"><div class="label">Show value marks on covers</div>
           <div class="help">$ under $9 · $$ $9–24 · $$$ $25 and up. Values always show when you open an album.</div></div>${sw("show_value_marks", p.show_value_marks)}</div>
-        <div class="set-row"><div class="grow"><div class="label">Discogs prices</div>
-          <div class="help">Market values for each pressing, refreshed monthly. Needs your Discogs token.</div></div><span class="soon-tag">Next</span></div>
+        <div id="discogs-box"><div class="set-row"><div class="help">Loading…</div></div></div>
       </div>
 
       <h2>Catalog</h2>
@@ -960,6 +1150,7 @@
     $("#set-import").addEventListener("change", importCatalog);
     renderStorage();
     drawRemoved();
+    drawDiscogs(s);
   }
 
   async function drawRemoved() {

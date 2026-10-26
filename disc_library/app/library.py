@@ -50,10 +50,14 @@ class RemoveError(ValueError):
 ALBUM_SELECT = """
 SELECT a.*, d.id AS disc_id, d.location_type, d.changer_id, d.slot, d.location_note,
        (SELECT MAX(started_at) FROM sessions s WHERE s.album_id = a.id) AS last_played,
-       (SELECT COUNT(*) FROM sessions s WHERE s.album_id = a.id AND s.completed = 1) AS full_listens
+       (SELECT COUNT(*) FROM sessions s WHERE s.album_id = a.id AND s.completed = 1) AS full_listens,
+       (SELECT COUNT(*) FROM discs dd WHERE dd.album_id = a.id) AS disc_count,
+       (SELECT COUNT(*) FROM discs dd WHERE dd.album_id = a.id AND dd.location_type = 'changer') AS discs_in_changer
 FROM albums a
-LEFT JOIN discs d ON d.album_id = a.id AND d.disc_number = 1
+LEFT JOIN discs d ON d.id = (SELECT id FROM discs WHERE album_id = a.id ORDER BY disc_number LIMIT 1)
 """
+
+ALBUM_YEAR = "COALESCE(a.original_year, a.year)"
 
 
 class LocationError(ValueError):
@@ -68,8 +72,11 @@ class Library:
     # --- browse ----------------------------------------------------------------
     def albums(self, q: str | None = None, genre: str | None = None, favorites: bool = False,
                media_kind: str | None = "audio", status: str | None = "owned", sort: str = "artist",
-               limit: int = 1000, offset: int = 0) -> list[dict]:
+               limit: int = 1000, offset: int = 0, decade: int | None = None) -> list[dict]:
         where, params = ["a.removed_at IS NULL"], []
+        if decade:
+            where.append(f"{ALBUM_YEAR} BETWEEN ? AND ?")
+            params += [decade, decade + 9]
         if q:
             where.append("""(a.artist LIKE ? OR a.title LIKE ? OR a.label LIKE ?
                              OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND t.title LIKE ?))""")
@@ -111,6 +118,12 @@ class Library:
                WHERE genre IS NOT NULL AND media_kind = 'audio' AND status = 'owned' AND removed_at IS NULL
                GROUP BY genre ORDER BY albums DESC"""
         )
+
+    def decades(self) -> list[dict]:
+        return self.db.query(
+            f"""SELECT ({ALBUM_YEAR} / 10) * 10 AS decade, COUNT(*) AS albums FROM albums a
+                WHERE {ALBUM_YEAR} IS NOT NULL AND a.media_kind = 'audio' AND a.status = 'owned'
+                  AND a.removed_at IS NULL GROUP BY 1 ORDER BY 1""")
 
     def set_favorite(self, album_id: int, favorite: bool) -> None:
         self.db.execute("UPDATE albums SET favorite = ? WHERE id = ?", (int(favorite), album_id))
@@ -172,21 +185,90 @@ class Library:
         a = self.db.one("SELECT id, artist, title, removed_at FROM albums WHERE id = ?", (album_id,))
         if not a:
             raise RemoveError("Album not found.")
-        discs = self.db.query("SELECT disc_number, location_type, changer_id, slot FROM discs WHERE album_id = ?", (album_id,))
+        discs = self.db.query("SELECT disc_number, location_type, changer_id, slot FROM discs WHERE album_id = ? "
+                              "ORDER BY disc_number", (album_id,))
         listens = self.db.one("SELECT COUNT(*) AS n FROM sessions WHERE album_id = ?", (album_id,))["n"]
         return {**a, "discs": discs, "listens": listens,
-                "slots": [d for d in discs if d["location_type"] == "changer"]}
+                "slots": [d for d in discs if d["location_type"] in ("changer", "to_pull")]}
+
+    # --- linking discs into a set by hand --------------------------------------------
+    def link_disc(self, album_id: int, other_id: int, as_disc: int) -> dict:
+        """Fold a one-disc album into this album as disc `as_disc` (for sets the spreadsheet names inconsistently)."""
+        if album_id == other_id:
+            raise ValueError("Pick a different album.")
+        a = self.db.one("SELECT * FROM albums WHERE id = ? AND removed_at IS NULL", (album_id,))
+        o = self.db.one("SELECT * FROM albums WHERE id = ? AND removed_at IS NULL", (other_id,))
+        if not a or not o:
+            raise ValueError("Album not found.")
+        if not 1 <= as_disc <= 20:
+            raise ValueError("Disc number must be 1-20.")
+        odiscs = self.db.query("SELECT * FROM discs WHERE album_id = ?", (other_id,))
+        if len(odiscs) != 1:
+            raise ValueError(f"{o['title']} already has several discs; link its discs the other way round.")
+        if self.db.one("SELECT 1 FROM discs WHERE album_id = ? AND disc_number = ?", (album_id, as_disc)):
+            raise ValueError(f"{a['title']} already has a disc {as_disc}.")
+        with self.db.connect() as con:
+            con.execute("UPDATE discs SET album_id = ?, disc_number = ? WHERE id = ?", (album_id, as_disc, odiscs[0]["id"]))
+            con.execute("UPDATE sessions SET album_id = ? WHERE album_id = ?", (album_id, other_id))
+            con.execute("INSERT OR REPLACE INTO import_aliases (import_key, album_id, disc_number) VALUES (?, ?, ?)",
+                        (o["import_key"], album_id, as_disc))
+            con.execute("UPDATE import_aliases SET album_id = ? WHERE album_id = ?", (album_id, other_id))
+            con.execute("DELETE FROM albums WHERE id = ?", (other_id,))
+            con.execute("""UPDATE albums SET paid = COALESCE(paid, ?), paid_source = COALESCE(paid_source, ?),
+                           enrich_status = CASE WHEN pressing_locked = 1 THEN enrich_status ELSE 'pending' END
+                           WHERE id = ?""", (o["paid"], o["paid_source"] if o["paid"] is not None else None, album_id))
+        return self.album(album_id)
+
+    def unlink_disc(self, disc_id: int) -> dict:
+        """Split one disc of a set back out into its own album."""
+        d = self.db.one("SELECT * FROM discs WHERE id = ?", (disc_id,))
+        if not d:
+            raise ValueError("Disc not found.")
+        a = self.db.one("SELECT * FROM albums WHERE id = ?", (d["album_id"],))
+        if self.db.one("SELECT COUNT(*) AS n FROM discs WHERE album_id = ?", (a["id"],))["n"] < 2:
+            raise ValueError("This album has only one disc.")
+        alias = self.db.one("SELECT import_key FROM import_aliases WHERE album_id = ? AND disc_number = ?",
+                            (a["id"], d["disc_number"]))
+        key = alias["import_key"] if alias else f"split|{a['import_key']}|{d['disc_number']}"
+        with self.db.connect() as con:
+            cur = con.execute(
+                """INSERT INTO albums (import_key, artist, title, year, label, format, media_kind, status, source_sheet)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (key, a["artist"], f"{a['title']} — Disc {d['disc_number']}", a["year"], a["label"], a["format"],
+                 a["media_kind"], a["status"], a["source_sheet"]))
+            con.execute("UPDATE discs SET album_id = ?, disc_number = 1 WHERE id = ?", (cur.lastrowid, disc_id))
+            con.execute("DELETE FROM import_aliases WHERE import_key = ?", (key,))
+            con.execute("DELETE FROM tracks WHERE album_id = ? AND disc_number = ?", (a["id"], d["disc_number"]))
+        return self.album(cur.lastrowid)
 
     def remove(self, album_id: int) -> dict:
         info = self.remove_preview(album_id)
         if info["removed_at"]:
             return info
         with self.db.connect() as con:
-            con.execute("""UPDATE discs SET prev_changer_id = changer_id, prev_slot = slot,
-                           location_type = CASE WHEN location_type = 'changer' THEN 'unassigned' ELSE location_type END,
-                           changer_id = NULL, slot = NULL WHERE album_id = ?""", (album_id,))
+            # Discs in a changer keep their slot, marked "to pull", so no new disc is sent into a slot
+            # that is still physically full. The slot frees when the disc is marked pulled.
+            con.execute("UPDATE discs SET location_type = 'to_pull' WHERE album_id = ? AND location_type = 'changer'",
+                        (album_id,))
             con.execute("UPDATE albums SET removed_at = datetime('now') WHERE id = ?", (album_id,))
         return self.remove_preview(album_id)
+
+    def to_pull(self) -> list[dict]:
+        return self.db.query(
+            """SELECT d.id AS disc_id, d.disc_number, d.changer_id, d.slot, a.id AS album_id, a.artist, a.title,
+                      a.art_url, (SELECT COUNT(*) FROM discs x WHERE x.album_id = a.id) AS disc_count
+               FROM discs d JOIN albums a ON a.id = d.album_id
+               WHERE d.location_type = 'to_pull' ORDER BY d.changer_id, d.slot""")
+
+    def mark_pulled(self, disc_ids: list[int]) -> int:
+        n = 0
+        with self.db.connect() as con:
+            for disc_id in disc_ids:
+                cur = con.execute(
+                    """UPDATE discs SET prev_changer_id = changer_id, prev_slot = slot, changer_id = NULL, slot = NULL,
+                       location_type = 'unassigned' WHERE id = ? AND location_type = 'to_pull'""", (disc_id,))
+                n += cur.rowcount
+        return n
 
     def restore(self, album_id: int) -> dict:
         """Bring a removed album back, into its old slot when that slot is still free."""
@@ -197,6 +279,10 @@ class Library:
         with self.db.connect() as con:
             con.execute("UPDATE albums SET removed_at = NULL WHERE id = ?", (album_id,))
             for d in con.execute("SELECT * FROM discs WHERE album_id = ?", (album_id,)).fetchall():
+                if d["location_type"] == "to_pull":  # never pulled: it's still sitting in its slot
+                    con.execute("UPDATE discs SET location_type = 'changer' WHERE id = ?", (d["id"],))
+                    back.append({"changer_id": d["changer_id"], "slot": d["slot"]})
+                    continue
                 if d["prev_slot"] and d["prev_changer_id"] in self.changer_ids:
                     taken = con.execute("SELECT 1 FROM discs WHERE changer_id = ? AND slot = ?",
                                         (d["prev_changer_id"], d["prev_slot"])).fetchone()

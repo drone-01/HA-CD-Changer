@@ -38,6 +38,9 @@ class Active:
     last_track: int
     played_sec: float = 0.0
     last_tick: float | None = None
+    disc_number: int = 1
+    total_tracks: int | None = None      # every disc of the album
+    heard_before: int = 0                # tracks heard on earlier discs of this session
 
 
 def score_full_listen(*, played_sec: float, runtime_sec: int | None, start_track: int,
@@ -70,28 +73,33 @@ class Player:
         self._lock = asyncio.Lock()
 
     # --- commands --------------------------------------------------------------
-    async def play_album(self, album_id: int, from_track: int = 1, user: str | None = None) -> dict:
+    async def play_album(self, album_id: int, from_track: int = 1, user: str | None = None,
+                         from_disc: int | None = None) -> dict:
         album = self.db.one("SELECT * FROM albums WHERE id = ?", (album_id,))
         if not album:
             raise PlayError("That album isn't in the library.")
-        disc = self.db.one(
-            "SELECT * FROM discs WHERE album_id = ? ORDER BY disc_number LIMIT 1", (album_id,)
-        )
+        discs = self.db.query("SELECT * FROM discs WHERE album_id = ? ORDER BY disc_number", (album_id,))
+        disc = next((d for d in discs if d["disc_number"] == from_disc), None) if from_disc else None
+        disc = disc or (discs[0] if discs else None)
+        label = f"Disc {disc['disc_number']} of {album['title']}" if disc and len(discs) > 1 else album["title"]
         if not disc or disc["location_type"] != "changer":
             where = self._describe_location(disc)
-            raise PlayError(f"{album['title']} isn't in a changer. {where}")
+            raise PlayError(f"{label} isn't in a changer. {where}")
         driver = self.drivers.get(disc["changer_id"])
         if driver is None:
             raise PlayError(f"Changer {disc['changer_id']} isn't configured.")
 
-        tracks = self.db.query(
-            "SELECT duration_sec FROM tracks WHERE album_id = ? AND disc_number = ?",
-            (album_id, disc["disc_number"]),
-        )
+        all_tracks = self.db.query("SELECT disc_number, duration_sec FROM tracks WHERE album_id = ?", (album_id,))
+        tracks = [t for t in all_tracks if t["disc_number"] == disc["disc_number"]]
         track_count = len(tracks) or None
         runtime = album["runtime_sec"] or (
-            sum(t["duration_sec"] or 0 for t in tracks) if tracks and all(t["duration_sec"] for t in tracks) else None
+            sum(t["duration_sec"] or 0 for t in all_tracks)
+            if all_tracks and all(t["duration_sec"] for t in all_tracks) else None
         )
+        if runtime and disc["disc_number"] != discs[0]["disc_number"]:
+            # Starting part-way through a set: only the discs from here on count toward the listen.
+            later = [t for t in all_tracks if t["disc_number"] >= disc["disc_number"]]
+            runtime = sum(t["duration_sec"] or 0 for t in later) or runtime
 
         async with self._lock:
             if self.active:
@@ -113,23 +121,26 @@ class Player:
                 raise PlayError(f"{driver.name} can't be controlled yet: {exc}") from exc
 
             sid = self.db.execute(
-                """INSERT INTO sessions (album_id, disc_id, changer_id, user_name, start_track, last_track)
-                   VALUES (?,?,?,?,?,?)""",
-                (album_id, disc["id"], driver.id, user, from_track, from_track),
+                """INSERT INTO sessions (album_id, disc_id, changer_id, user_name, start_track, last_track, last_disc)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (album_id, disc["id"], driver.id, user, from_track, from_track, disc["disc_number"]),
             )
+            later_tracks = [t for t in all_tracks if t["disc_number"] >= disc["disc_number"]]
             self.active = Active(sid, album_id, disc["id"], driver.id, disc["slot"], from_track,
-                                 track_count, runtime, from_track, 0.0, self.clock())
+                                 track_count, runtime, from_track, 0.0, self.clock(),
+                                 disc_number=disc["disc_number"], total_tracks=len(later_tracks) or None)
         log.info("Playing %s - %s on %s slot %s from track %s",
                  album["artist"], album["title"], driver.name, disc["slot"], from_track)
         return await self.now_playing()
 
     async def resume_album(self, album_id: int, user: str | None = None) -> dict:
         last = self.db.one(
-            """SELECT last_track FROM sessions WHERE album_id = ? AND completed = 0 AND ended_at IS NOT NULL
+            """SELECT last_track, last_disc FROM sessions WHERE album_id = ? AND completed = 0 AND ended_at IS NOT NULL
                ORDER BY started_at DESC, id DESC LIMIT 1""",
             (album_id,),
         )
-        return await self.play_album(album_id, from_track=(last["last_track"] if last else 1), user=user)
+        return await self.play_album(album_id, from_track=(last["last_track"] if last else 1), user=user,
+                                     from_disc=(last["last_disc"] if last else None))
 
     async def transport(self, action: str) -> dict:
         if not self.active:
@@ -176,17 +187,53 @@ class Player:
             (a.last_track, int(a.played_sec), a.session_id),
         )
         if st.disc_finished:
-            await self._end("finished")
+            if not await self._next_disc():
+                await self._end("finished")
         elif st.state == "stopped":
             await self._end("stopped")
+
+    async def _next_disc(self) -> bool:
+        """At the end of one disc of a set, carry on with the next disc, on whichever changer holds it.
+
+        Returns False when there is no next disc. When the next disc isn't in a changer the session
+        ends there, so it counts as a partial listen.
+        """
+        a = self.active
+        nxt = self.db.one("SELECT * FROM discs WHERE album_id = ? AND disc_number > ? ORDER BY disc_number LIMIT 1",
+                          (a.album_id, a.disc_number))
+        if not nxt:
+            return False
+        driver = self.drivers.get(nxt["changer_id"]) if nxt["location_type"] == "changer" else None
+        if driver is None:
+            await self._end("next_disc_missing")
+            return True
+        count = self.db.one("SELECT COUNT(*) AS n FROM tracks WHERE album_id = ? AND disc_number = ?",
+                            (a.album_id, nxt["disc_number"]))["n"] or None
+        if driver.id != a.changer_id:
+            try:
+                await self.drivers[a.changer_id].stop()
+            except NotImplementedError:
+                pass
+        try:
+            await driver.load_and_play(nxt["slot"], 1, count)
+        except NotImplementedError:
+            await self._end("next_disc_missing")
+            return True
+        a.heard_before += (a.last_track - a.start_track) + 1
+        a.disc_id, a.changer_id, a.slot, a.disc_number = nxt["id"], driver.id, nxt["slot"], nxt["disc_number"]
+        a.track_count, a.start_track, a.last_track = count, 1, 1
+        self.db.execute("UPDATE sessions SET disc_id = ?, changer_id = ?, last_disc = ?, last_track = 1 WHERE id = ?",
+                        (nxt["id"], driver.id, nxt["disc_number"], a.session_id))
+        log.info("Continuing with disc %s on %s slot %s", nxt["disc_number"], driver.name, nxt["slot"])
+        return True
 
     async def _end(self, reason: str) -> None:
         a = self.active
         if not a:
             return
         full = score_full_listen(
-            played_sec=a.played_sec, runtime_sec=a.runtime_sec, start_track=a.start_track,
-            last_track=a.last_track, track_count=a.track_count, finished=(reason == "finished"),
+            played_sec=a.played_sec, runtime_sec=a.runtime_sec, start_track=a.start_track - a.heard_before,
+            last_track=a.last_track, track_count=a.total_tracks or a.track_count, finished=(reason == "finished"),
             ratio=(self.prefs.get("full_listen_percent") / 100) if self.prefs else FULL_LISTEN_RATIO,
         )
         self.db.execute(
@@ -208,7 +255,7 @@ class Player:
         except NotImplementedError:
             st = {}
         tracks = self.db.query(
-            "SELECT number, title, duration_sec FROM tracks WHERE album_id = ? ORDER BY disc_number, number",
+            "SELECT disc_number, number, title, duration_sec FROM tracks WHERE album_id = ? ORDER BY disc_number, number",
             (a.album_id,),
         )
         return {
@@ -216,6 +263,8 @@ class Player:
             "album": album,
             "tracks": tracks,
             "changer": {"id": driver.id, "name": driver.name, "slot": a.slot},
+            "disc_number": a.disc_number,
+            "disc_count": self.db.one("SELECT COUNT(*) AS n FROM discs WHERE album_id = ?", (a.album_id,))["n"],
             "status": st,
             "track": st.get("track") or a.last_track,
             "track_count": a.track_count,
@@ -231,4 +280,5 @@ class Player:
             "shelf": f"It's on the shelf{note}.",
             "player": f"It's in another player{note}.",
             "loaned": f"It's loaned out{note}.",
+            "to_pull": "It's waiting to be pulled from the changer after being removed.",
         }.get(t, "Assign it a changer slot first.")

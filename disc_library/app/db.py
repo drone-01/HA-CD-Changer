@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     end_reason    TEXT                                 -- finished | stopped | replaced
 );
 
+-- Spreadsheet rows linked by hand into another album as one of its discs (v0.6.0).
+CREATE TABLE IF NOT EXISTS import_aliases (
+    import_key    TEXT PRIMARY KEY,
+    album_id      INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+    disc_number   INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS ix_sessions_album ON sessions(album_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_started ON sessions(started_at);
 CREATE INDEX IF NOT EXISTS ix_albums_artist ON albums(artist, year);
@@ -111,6 +118,10 @@ MIGRATIONS = {
         "value_source": "TEXT",                 # discogs | manual
         "value_at": "TEXT",
         "discogs_release": "TEXT",
+        "value_basis": "TEXT",                  # VG | lowest listing | no price on Discogs | not found (v0.6.0)
+    },
+    "sessions": {
+        "last_disc": "INTEGER NOT NULL DEFAULT 1",   # disc of a set the session was on (v0.6.0)
     },
     "discs": {
         "prev_changer_id": "INTEGER",           # where the disc was before it was removed or loaned

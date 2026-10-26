@@ -31,6 +31,8 @@ from .ha_client import HAClient
 from .importer import import_workbook
 from .prefs import Prefs, PrefsError
 from .library import Library, LocationError, RemoveError
+from .sets import merge_sets
+from .discogs import CONDITIONS, Discogs, DiscogsAuthError, ValueUpdater
 from .player import PlayError, Player
 
 log = logging.getLogger("disc_library")
@@ -39,6 +41,21 @@ log = logging.getLogger("disc_library")
 class PlayBody(BaseModel):
     album_id: int
     from_track: int = 1
+    disc: int | None = None
+
+
+class LinkBody(BaseModel):
+    other_id: int
+    as_disc: int
+
+
+class PulledBody(BaseModel):
+    disc_ids: list[int]
+
+
+class ManualLockBody(BaseModel):
+    catalog_no: str | None = None
+    barcode: str | None = None
 
 
 class LocationBody(BaseModel):
@@ -92,9 +109,10 @@ def _since(range_: str) -> str | None:
 
 
 def create_app(settings: Settings | None = None, drivers: dict | None = None, ha: HAClient | None = None,
-               enricher: Enricher | None = None) -> FastAPI:
+               enricher: Enricher | None = None, values: ValueUpdater | None = None) -> FastAPI:
     settings = settings or load_settings()
     db = Database(settings.db_path)
+    merged_sets = merge_sets(db)  # one-row-per-disc albums from before v0.6.0 become one album per set
     # A session still open from before a restart can't be followed any more.
     db.execute("""UPDATE sessions SET ended_at = datetime('now'), end_reason = 'interrupted'
                   WHERE ended_at IS NULL""")
@@ -106,6 +124,7 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
     enricher = enricher or Enricher(db, art_dir)
     if enricher.prefs is None:
         enricher.prefs = prefs
+    values = values or ValueUpdater(db, prefs)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -120,9 +139,25 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
                     log.exception("poll failed")
                 await asyncio.sleep(settings.poll_seconds)
 
+        async def value_loop():
+            # Keep Discogs prices fresh: check a few minutes after start, then every 6 hours.
+            await asyncio.sleep(300)
+            while True:
+                try:
+                    if prefs.get("discogs_token") and not values.state.running and values.due():
+                        values.start()
+                except Exception:
+                    log.exception("value refresh check failed")
+                await asyncio.sleep(6 * 3600)
+
         task = asyncio.create_task(poll_loop())
+        vtask = asyncio.create_task(value_loop())
+        if merged_sets:
+            log.info("Combined %s multi-disc sets; looking them up again", len(merged_sets))
+            enricher.start()
         yield
         task.cancel()
+        vtask.cancel()
         for d in drivers.values():
             await d.close()
 
@@ -207,9 +242,64 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
     # --- library ---------------------------------------------------------------
     @app.get("/api/albums")
     def albums(q: str | None = None, genre: str | None = None, favorites: bool = False,
-               media: str = "audio", sort: str = "artist", limit: int = 1000, offset: int = 0):
-        return library.albums(q=q, genre=genre, favorites=favorites,
+               media: str = "audio", sort: str = "artist", limit: int = 1000, offset: int = 0,
+               decade: int | None = None):
+        return library.albums(q=q, genre=genre, favorites=favorites, decade=decade,
                               media_kind=None if media == "all" else media, sort=sort, limit=limit, offset=offset)
+
+    @app.get("/api/decades")
+    def decades():
+        return library.decades()
+
+    @app.get("/api/albums/{album_id}/link-candidates")
+    def link_candidates(album_id: int):
+        a = library.album(album_id)
+        if not a:
+            raise HTTPException(404, "Album not found")
+        return db.query(
+            """SELECT a.id, a.artist, a.title, a.year, a.catalog_no FROM albums a
+               WHERE a.id != ? AND a.removed_at IS NULL AND a.media_kind = ?
+                 AND (SELECT COUNT(*) FROM discs d WHERE d.album_id = a.id) = 1
+               ORDER BY (a.artist = ?) DESC, a.artist COLLATE NOCASE, a.title COLLATE NOCASE""",
+            (album_id, a["media_kind"], a["artist"]))
+
+    @app.post("/api/albums/{album_id}/link")
+    def link_disc(album_id: int, body: LinkBody):
+        try:
+            return library.link_disc(album_id, body.other_id, body.as_disc)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/discs/{disc_id}/unlink")
+    def unlink_disc(disc_id: int):
+        try:
+            return library.unlink_disc(disc_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/to-pull")
+    def to_pull():
+        return library.to_pull()
+
+    @app.post("/api/to-pull/pulled")
+    def pulled(body: PulledBody):
+        return {"pulled": library.mark_pulled(body.disc_ids)}
+
+    @app.post("/api/albums/{album_id}/lock-manual")
+    def lock_manual(album_id: int, body: ManualLockBody):
+        """Save the catalog number / barcode on the disc and lock it, when MusicBrainz has no such release."""
+        cat = (body.catalog_no or "").strip() or None
+        bc = "".join(ch for ch in (body.barcode or "") if ch.isdigit()) or None
+        if not cat and not bc:
+            raise HTTPException(400, "Type the catalog number or barcode first.")
+        if not library.album(album_id):
+            raise HTTPException(404, "Album not found")
+        db.execute(
+            """UPDATE albums SET catalog_verified = ?, barcode = COALESCE(?, barcode), pressing_locked = 1,
+               locked_at = datetime('now'), match_method = 'manual', enrich_status = 'manual',
+               enrich_note = 'catalog number entered by hand; not on MusicBrainz' WHERE id = ?""",
+            (cat, bc, album_id))
+        return library.album(album_id)
 
     @app.get("/api/albums/{album_id}")
     def album(album_id: int):
@@ -317,7 +407,7 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
     @app.post("/api/play")
     async def play(body: PlayBody, request: Request):
         try:
-            return await player.play_album(body.album_id, body.from_track, _user(request))
+            return await player.play_album(body.album_id, body.from_track, _user(request), from_disc=body.disc)
         except PlayError as exc:
             raise HTTPException(409, str(exc)) from exc
 
@@ -329,13 +419,15 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
             raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/random")
-    async def random_album(request: Request, genre: str | None = None):
-        picks = library.vibe(seed=None, count=50)
-        if genre:
-            picks = [p for p in picks if genre in (p["genre"], p["subgenre"])]
+    async def random_album(request: Request, genre: str | None = None, decade: int | None = None,
+                           favorites: bool = False):
+        import random as _random
+        picks = [a for a in library.albums(genre=genre, decade=decade, favorites=favorites, limit=5000)
+                 if a["location_type"] == "changer"]
         if not picks:
-            raise HTTPException(409, "No albums are in a changer yet.")
-        return await player.play_album(picks[0]["id"], 1, _user(request))
+            what = " ".join(x for x in [f"{decade}s" if decade else "", genre or "", "favorite" if favorites else ""] if x)
+            raise HTTPException(409, f"No {what + ' ' if what else ''}albums are in a changer yet.")
+        return await player.play_album(_random.choice(picks)["id"], 1, _user(request))
 
     @app.post("/api/transport/{action}")
     async def transport(action: str):
@@ -378,7 +470,8 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
             changers.append({"id": c.id, "name": c.name, "driver": c.driver, "host": c.host,
                              "port": c.port, "state": state})
         return {
-            "prefs": prefs.all(),
+            "prefs": prefs.public(),
+            "conditions": CONDITIONS,
             "version": __version__,
             "configured_listen_script": settings.listen_script or "",
             "changers": changers,
@@ -386,14 +479,64 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
 
     @app.get("/api/prefs")
     def get_prefs():
-        return prefs.all()
+        return prefs.public()
 
     @app.put("/api/settings")
     def put_settings(body: dict):
+        if any(k in body for k in ("discogs_token", "discogs_user")):
+            raise HTTPException(400, "Use Connect Discogs to set the token.")
         try:
-            return {"prefs": prefs.update(body)}
+            prefs.update(body)
+            return {"prefs": prefs.public()}
         except PrefsError as exc:
             raise HTTPException(400, str(exc)) from exc
+
+    # --- Discogs values ------------------------------------------------------------
+    @app.post("/api/discogs/connect")
+    async def discogs_connect(body: dict):
+        token = str(body.get("token") or "").strip()
+        if not token:
+            raise HTTPException(400, "Paste your Discogs token first.")
+        try:
+            async with values.client_factory() as client:
+                user = await Discogs(client, token).identity()
+        except DiscogsAuthError as exc:
+            raise HTTPException(400, f"{exc} Copy it again from Discogs → Settings → Developers.") from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"Can't reach Discogs from Home Assistant ({type(exc).__name__}).") from exc
+        prefs.update({"discogs_token": token, "discogs_user": user})
+        values.start()
+        return {"user": user, "job": values.state.__dict__}
+
+    @app.post("/api/discogs/disconnect")
+    def discogs_disconnect():
+        values.stop()
+        prefs.update({"discogs_token": "", "discogs_user": ""})
+        return {"ok": True}
+
+    @app.get("/api/values")
+    def values_status():
+        return {"job": values.state.__dict__, "counts": values.counts()}
+
+    @app.post("/api/values/start")
+    def values_start(force: bool = False):
+        return {"job": values.start(force=force).__dict__}
+
+    @app.post("/api/values/stop")
+    def values_stop():
+        return {"job": values.stop().__dict__}
+
+    @app.post("/api/albums/{album_id}/value/refresh")
+    async def value_refresh(album_id: int):
+        if not prefs.get("discogs_token"):
+            raise HTTPException(400, "Connect Discogs in Settings first.")
+        if values.state.running:
+            raise HTTPException(409, "Prices are updating right now; try again when that finishes.")
+        db.execute("UPDATE albums SET discogs_release = NULL WHERE id = ? AND COALESCE(value_source,'') != 'manual'",
+                   (album_id,))
+        values.start(album_ids=[album_id])
+        await values.wait()
+        return library.album(album_id)
 
     @app.get("/api/storage")
     def storage():

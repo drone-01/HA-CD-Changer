@@ -14,7 +14,11 @@ DEFAULTS: dict[str, object] = {
     "apple_covers": True,           # fall back to Apple Music artwork when the Cover Art Archive has none
     "auto_sync_on_import": True,    # look up new albums right after a spreadsheet import
     "show_value_marks": False,      # $ / $$ / $$$ on library covers
+    "discogs_token": "",            # personal access token; never sent back to the browser
+    "discogs_user": "",
+    "discogs_condition": "Very Good (VG)",
 }
+SECRET = ("discogs_token",)
 
 
 class PrefsError(ValueError):
@@ -35,6 +39,13 @@ def _coerce(key: str, value: object) -> object:
         if v and not v.startswith("script."):
             raise PrefsError("The theater script must be a script entity, like script.theater_listen.")
         return v
+    if key in ("discogs_token", "discogs_user"):
+        return str(value or "").strip()
+    if key == "discogs_condition":
+        from .discogs import CONDITIONS
+        if value not in CONDITIONS:
+            raise PrefsError("Pick one of the Discogs conditions.")
+        return value
     if isinstance(DEFAULTS[key], bool):
         if isinstance(value, str):
             return value.lower() in ("1", "true", "yes", "on")
@@ -55,6 +66,13 @@ class Prefs:
                     out[r["key"]] = _coerce(r["key"], r["value"])
                 except PrefsError:
                     pass
+        return out
+
+    def public(self) -> dict:
+        """Settings safe to send to the browser: secrets become has_<name>."""
+        out = self.all()
+        for k in SECRET:
+            out["has_" + k] = bool(out.pop(k))
         return out
 
     def get(self, key: str):

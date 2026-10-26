@@ -14,6 +14,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from .db import Database
+from .sets import merge_sets, set_key, set_member
 
 # header text (lower-case, trimmed) -> field
 HEADER_MAP = {
@@ -125,40 +126,71 @@ def parse_workbook(path: Path | str) -> list[dict]:
 
 
 def import_workbook(db: Database, path: Path | str) -> dict:
+    """Load the spreadsheet. Each disc of a multi-disc set becomes a disc of one album."""
     rows = parse_workbook(path)
-    added = updated = removed = 0
+    merge_sets(db)  # fold any one-row-per-disc albums from before sets existed
     by_sheet: dict[str, int] = {}
+    groups: dict[str, list[tuple[int, dict]]] = {}
+    order: list[str] = []
+    for r in rows:
+        by_sheet[r["source_sheet"]] = by_sheet.get(r["source_sheet"], 0) + 1
+        member = set_member(r["title"], r["edition_notes"])
+        if member:
+            base, n = member
+            key = set_key(r["artist"], base, r["format"])
+            r = {**r, "title": base}
+        else:
+            key, n = import_key(r["artist"], r["title"], r["format"], r["catalog_no"]), 1
+        if key not in groups:
+            order.append(key)
+            groups[key] = []
+        groups[key].append((n, r))
+
+    added = updated = removed = 0
     with db.connect() as con:
-        for r in rows:
-            key = import_key(r["artist"], r["title"], r["format"], r["catalog_no"])
-            by_sheet[r["source_sheet"]] = by_sheet.get(r["source_sheet"], 0) + 1
+        for key in order:
+            members = sorted(groups[key], key=lambda m: m[0])
+            r = members[0][1]  # the lowest disc speaks for the set
+            numbers = sorted({n for n, _ in members})
+            paid = next((m["paid"] for _, m in members if m["paid"] is not None), None)
+            catalog = next((m["catalog_no"] for _, m in members if m["catalog_no"]), None)
+            status = "owned" if any(m["status"] == "owned" for _, m in members) else r["status"]
+            alias = con.execute("SELECT album_id, disc_number FROM import_aliases WHERE import_key = ?", (key,)).fetchone()
+            if alias:  # linked by hand into another album as one of its discs
+                con.execute("INSERT OR IGNORE INTO discs (album_id, disc_number) VALUES (?, ?)",
+                            (alias["album_id"], alias["disc_number"]))
+                updated += 1
+                continue
             existing = con.execute("SELECT id, removed_at FROM albums WHERE import_key = ?", (key,)).fetchone()
             if existing and existing["removed_at"]:
                 removed += 1  # removed in the app: stays removed until restored there
                 continue
             if existing:
+                album_id = existing["id"]
                 con.execute(
                     """UPDATE albums SET artist=?, title=?, year=?, label=?, catalog_no=?, format=?,
                        media_kind=?, edition_notes=?, status=?, source_sheet=?, updated_at=datetime('now')
                        WHERE id=?""",
-                    (r["artist"], r["title"], r["year"], r["label"], r["catalog_no"], r["format"],
-                     r["media_kind"], r["edition_notes"], r["status"], r["source_sheet"], existing["id"]),
+                    (r["artist"], r["title"], r["year"], r["label"], catalog, r["format"],
+                     r["media_kind"], r["edition_notes"], status, r["source_sheet"], album_id),
                 )
                 con.execute(
                     """UPDATE albums SET paid = ?, paid_source = CASE WHEN ? IS NULL THEN NULL ELSE 'notes' END
                        WHERE id = ? AND COALESCE(paid_source, 'notes') = 'notes'""",
-                    (r["paid"], r["paid"], existing["id"]))
+                    (paid, paid, album_id))
                 updated += 1
             else:
                 cur = con.execute(
                     """INSERT INTO albums (import_key, artist, title, year, label, catalog_no, format,
                        media_kind, edition_notes, status, source_sheet, paid, paid_source)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (key, r["artist"], r["title"], r["year"], r["label"], r["catalog_no"], r["format"],
-                     r["media_kind"], r["edition_notes"], r["status"], r["source_sheet"],
-                     r["paid"], "notes" if r["paid"] is not None else None),
+                    (key, r["artist"], r["title"], r["year"], r["label"], catalog, r["format"],
+                     r["media_kind"], r["edition_notes"], status, r["source_sheet"],
+                     paid, "notes" if paid is not None else None),
                 )
-                con.execute("INSERT INTO discs (album_id, disc_number) VALUES (?, 1)", (cur.lastrowid,))
+                album_id = cur.lastrowid
                 added += 1
+            for n in numbers:
+                con.execute("INSERT OR IGNORE INTO discs (album_id, disc_number) VALUES (?, ?)", (album_id, n))
     return {"rows": len(rows), "added": added, "updated": updated, "skipped_removed": removed,
             "by_sheet": by_sheet}

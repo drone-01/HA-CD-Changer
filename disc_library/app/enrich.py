@@ -530,12 +530,19 @@ class Enricher:
 
     def _store(self, album: dict, rel: dict, genres: list[dict], disc_hint: int) -> None:
         media = rel.get("media") or []
-        medium = next((m for m in media if m.get("position") == disc_hint), media[0] if media else None)
+        # One album can hold several discs of a set: store the tracks of each disc owned.
+        owned = [d["disc_number"] for d in self.db.query(
+            "SELECT disc_number FROM discs WHERE album_id = ? ORDER BY disc_number", (album["id"],))] or [disc_hint]
+        by_pos = {m.get("position"): m for m in media}
+        chosen = [(n, by_pos[n]) for n in owned if n in by_pos]
+        if not chosen and media:
+            chosen = [(owned[0], media[0])]  # a single-medium release for a lone disc
         tracks = []
-        for t in (medium or {}).get("tracks") or []:
-            length = t.get("length") or (t.get("recording") or {}).get("length")
-            tracks.append((t.get("position"), t.get("title"), round(length / 1000) if length else None))
-        runtime = sum(d for _, _, d in tracks if d) if tracks and all(d for _, _, d in tracks) else None
+        for n, medium in chosen:
+            for t in medium.get("tracks") or []:
+                length = t.get("length") or (t.get("recording") or {}).get("length")
+                tracks.append((n, t.get("position"), t.get("title"), round(length / 1000) if length else None))
+        runtime = sum(d for *_, d in tracks if d) if tracks and all(d for *_, d in tracks) else None
         bucket, top = bucket_genres(genres)
         rg = rel.get("release-group") or {}
         first = (rg.get("first-release-date") or "")[:4]
@@ -543,8 +550,8 @@ class Enricher:
         with self.db.connect() as con:
             con.execute("DELETE FROM tracks WHERE album_id = ?", (album["id"],))
             con.executemany(
-                "INSERT INTO tracks (album_id, disc_number, number, title, duration_sec) VALUES (?, 1, ?, ?, ?)",
-                [(album["id"], n, title, d) for n, title, d in tracks if n],
+                "INSERT OR IGNORE INTO tracks (album_id, disc_number, number, title, duration_sec) VALUES (?, ?, ?, ?, ?)",
+                [(album["id"], disc, n, title, d) for disc, n, title, d in tracks if n],
             )
             con.execute(
                 """UPDATE albums SET runtime_sec = ?, original_year = ?,

@@ -116,3 +116,30 @@ def test_remove_and_money_api(tmp_path, drivers, workbook):
         assert c.post(f"/api/albums/{dirt['id']}/restore").status_code == 200
         assert "Dirt" in [a["title"] for a in c.get("/api/albums").json()]
         assert c.delete("/api/albums/99999").status_code == 404
+
+
+def test_manual_lock_link_and_pull_api(tmp_path, drivers, workbook):
+    with make_client(tmp_path, drivers) as c:
+        c.post("/api/import", files={"file": ("CD_Collection.xlsx", workbook.read_bytes())})
+        albums = {a["title"]: a for a in c.get("/api/albums").json()}
+        tds, dirt = albums["The Downward Spiral"], albums["Dirt"]
+        assert c.post(f"/api/albums/{tds['id']}/lock-manual", json={}).status_code == 400
+        a = c.post(f"/api/albums/{tds['id']}/lock-manual", json={"catalog_no": "INTD-92346", "barcode": "6069 4923 46"}).json()
+        assert (a["pressing_locked"], a["catalog_verified"], a["barcode"]) == (1, "INTD-92346", "606949234 6".replace(" ", ""))
+        cands = c.get(f"/api/albums/{dirt['id']}/link-candidates").json()
+        assert tds["id"] in [x["id"] for x in cands]
+        linked = c.post(f"/api/albums/{dirt['id']}/link", json={"other_id": tds["id"], "as_disc": 2}).json()
+        assert len(linked["discs"]) == 2
+        d1, d2 = linked["discs"]
+        c.post(f"/api/discs/{d1['id']}/location", json={"location_type": "changer", "changer_id": 1, "slot": 4})
+        c.post(f"/api/discs/{d2['id']}/location", json={"location_type": "changer", "changer_id": 2, "slot": 8})
+        prev = c.get(f"/api/albums/{dirt['id']}/remove-preview").json()
+        assert len(prev["slots"]) == 2
+        c.delete(f"/api/albums/{dirt['id']}")
+        pull = c.get("/api/to-pull").json()
+        assert [(p["changer_id"], p["slot"]) for p in pull] == [(1, 4), (2, 8)]
+        assert c.post("/api/to-pull/pulled", json={"disc_ids": [p["disc_id"] for p in pull]}).json()["pulled"] == 2
+        assert c.get("/api/to-pull").json() == []
+        assert c.get("/api/decades").status_code == 200
+        assert c.put("/api/settings", json={"discogs_token": "x"}).status_code == 400
+        assert "discogs_token" not in c.get("/api/prefs").json()
