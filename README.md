@@ -4,7 +4,7 @@ An album-first app for browsing and playing a physical disc collection across
 two Sony BDP-CX7000ES 400-disc changers. It runs as a Home Assistant add-on
 with its own sidebar panel, designed for the iPhone first.
 
-## What works today (v0.7.0)
+## What works today (v0.8.0)
 
 | Area | Status |
 | --- | --- |
@@ -103,6 +103,15 @@ request a second). Covers are saved in the add-on's data folder, so the grid sta
   (Settings → Value). The library can be sorted by value.
 - Stats → Collection: albums, discs, formats, changer slots used and free, discs not in a changer,
   total play time, collection value, paid, average value, cost per listen, most valuable.
+
+## Real changer control (Sony BDP-CX7000ES)
+
+On the changer: System Settings → Custom Installation Control → **Network**, and give it a fixed IP
+(a DHCP reservation). In the app's configuration set that changer's `driver: cx7000es` and
+`host: <its IP>` (`port` defaults to 8888; `command_set` 1–3 if the unit isn't on BD1). The app drives
+it over Sony's UPnP CIS service: play a slot at a track (waking it from standby first), pause, resume,
+stop, next/previous, live status, finish detection, and reading which slots hold discs. Details in
+`docs/cx7000es-control.md`.
 
 ## Loading discs into the changers
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+
+import httpx
 import time
 from dataclasses import dataclass
 
@@ -119,6 +121,8 @@ class Player:
                 await driver.load_and_play(disc["slot"], from_track, track_count)
             except NotImplementedError as exc:
                 raise PlayError(f"{driver.name} can't be controlled yet: {exc}") from exc
+            except (RuntimeError, OSError, httpx.HTTPError) as exc:
+                raise PlayError(f"{driver.name} didn't respond: {exc}") from exc
 
             sid = self.db.execute(
                 """INSERT INTO sessions (album_id, disc_id, changer_id, user_name, start_track, last_track, last_disc)
@@ -157,7 +161,10 @@ class Player:
             raise PlayError(f"Unknown action: {action}")
         async with self._lock:
             await self._tick()
-            await actions[action]()
+            try:
+                await actions[action]()
+            except (RuntimeError, OSError, httpx.HTTPError) as exc:
+                raise PlayError(f"{driver.name} didn't respond: {exc}") from exc
             if action == "stop":
                 await self._end("stopped")
         return await self.now_playing()
@@ -177,6 +184,9 @@ class Player:
         except NotImplementedError:
             return
         now = self.clock()
+        if not st.online:  # a network blip: keep the session, don't count the time
+            a.last_tick = now
+            return
         if a.last_tick is not None and st.state == "playing":
             a.played_sec += now - a.last_tick
         a.last_tick = now

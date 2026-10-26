@@ -21,6 +21,7 @@ class ChangerConfig:
     driver: str = "simulated"
     host: str | None = None
     port: int | None = None
+    command_set: int = 1          # CX7000ES "BD1/BD2/BD3" command set (Settings > Remote Control on the unit)
 
 
 @dataclass
@@ -59,6 +60,7 @@ def load_settings() -> Settings:
             driver=c.get("driver", "simulated"),
             host=c.get("host") or None,
             port=c.get("port") or None,
+            command_set=int(c.get("command_set") or 1),
         )
         for i, c in enumerate(raw_changers)
     ]
