@@ -1,3 +1,3 @@
 """Disc Library: album-first control of Sony disc changers from Home Assistant."""
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"

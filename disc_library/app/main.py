@@ -574,7 +574,7 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
         return {"user": user, "job": values.state.__dict__}
 
     @app.post("/api/discogs/disconnect")
-    def discogs_disconnect():
+    async def discogs_disconnect():
         values.stop()
         prefs.update({"discogs_token": "", "discogs_user": ""})
         return {"ok": True}
@@ -584,11 +584,11 @@ def create_app(settings: Settings | None = None, drivers: dict | None = None, ha
         return {"job": values.state.__dict__, "counts": values.counts()}
 
     @app.post("/api/values/start")
-    def values_start(force: bool = False):
+    async def values_start(force: bool = False):
         return {"job": values.start(force=force).__dict__}
 
     @app.post("/api/values/stop")
-    def values_stop():
+    async def values_stop():
         return {"job": values.stop().__dict__}
 
     @app.post("/api/albums/{album_id}/value/refresh")

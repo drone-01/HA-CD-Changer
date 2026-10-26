@@ -105,3 +105,30 @@ def test_thin_listings_are_flagged_and_left_out(db, workbook):
     db.execute("UPDATE albums SET value = 8, value_source = 'discogs', value_basis = 'VG' WHERE title = 'Nevermind'")
     c = Library(db, [1]).collection()
     assert c["money"]["value_total"] == 8 and c["money"]["value_thin"] == 1
+
+
+def test_values_start_endpoint_runs_on_the_event_loop(tmp_path, drivers, workbook):
+    from fastapi.testclient import TestClient
+    from app.config import ChangerConfig, Settings
+    from app.db import Database
+    from app.enrich import Enricher
+    from app.ha_client import HAClient
+    from app.main import create_app
+    www = tmp_path / "www"
+    www.mkdir()
+    (www / "index.html").write_text("<!doctype html>")
+    settings = Settings(data_dir=tmp_path, www_dir=www, changers=[ChangerConfig(1, "Changer 1")])
+    db = Database(settings.db_path)
+    calls = []
+    prefs = Prefs(db)
+    prefs.update({"discogs_token": "tok"})
+    vu = ValueUpdater(db, prefs, interval=0,
+                      client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(fake_discogs(calls))))
+    enr = Enricher(db, tmp_path / "art", mb_interval=0,
+                   client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"releases": []}))))
+    with TestClient(create_app(settings, drivers=drivers, ha=HAClient(token=""), enricher=enr, values=vu)) as c:
+        c.put("/api/settings", json={"auto_sync_on_import": False})
+        c.post("/api/import", files={"file": ("CD_Collection.xlsx", workbook.read_bytes())})
+        r = c.post("/api/values/start?force=true")
+        assert r.status_code == 200 and r.json()["job"]["running"] is True
+        assert c.post("/api/values/stop").status_code == 200
