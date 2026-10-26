@@ -66,9 +66,9 @@ class FakeChanger:
             self.state = 0x11
         elif cmd == 0x14:
             self.state = 0x10
-        elif cmd == 0xCC and not data:  # slot bitmap: five frames in one answer
+        elif cmd == 0xCC and len(data) == 1:  # slot bitmap, one packet per request
             out = b""
-            for packet in range(5):
+            for packet in [data[0]]:
                 bits = bytearray(10)
                 if packet == 0:
                     bits[0] = 0b00000001          # slot 1

@@ -16,6 +16,7 @@ remembers the disc; the status poll sends the play command once the changer is u
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -191,29 +192,27 @@ class Cx7000esDriver(ChangerDriver):
     async def occupied_slots(self) -> list[int]:
         """Slots the changer reports as holding a disc (for the slot check).
 
-        The request carries no data; the answer is five frames, one per 80 slots, each starting with
-        its packet number (0-4) followed by ten bitmap bytes, bit 0 = the lowest slot.
+        Over the network the request names a packet (0-4, one per 80 slots); the answer repeats the
+        packet number followed by ten bitmap bytes, bit 0 = the lowest slot.
         """
-        packets: dict[int, bytes] = {}
-        reply = await self._raw(frame(self.pdc, IP_DISC_EXIST))
-        log.info("%s: slot bitmap reply %s", self.name, reply.hex())
-        for pdc, cmd, data in parse_all(reply):
-            if cmd == IP_DISC_EXIST and len(data) >= 11 and data[0] <= 4:
-                packets[data[0]] = data[1:11]
-        for packet in range(5):  # some firmware answers one packet per request: ask for any that are missing
-            if packet not in packets:
-                for pdc, cmd, data in parse_all(await self._raw(frame(self.pdc, IP_DISC_EXIST, bytes([packet])))):
-                    if cmd == IP_DISC_EXIST and len(data) >= 11 and data[0] <= 4:
-                        packets.setdefault(data[0], data[1:11])
-        if len(packets) < 5:
-            raise ChangerCommandError(f"{self.name} didn't report all of its slots.")
         slots: list[int] = []
-        for packet, bits in sorted(packets.items()):
-            for i, byte in enumerate(bits):
-                for bit in range(8):
-                    if byte & (1 << bit):
-                        slots.append(packet * 80 + i * 8 + bit + 1)
-        return slots
+        for packet in range(5):
+            reply = await self._raw(frame(self.pdc, IP_DISC_EXIST, bytes([packet])))
+            log.info("%s: slot bitmap packet %s reply %s", self.name, packet, reply.hex())
+            frames = [f for f in parse_all(reply) if f[1] == IP_DISC_EXIST and len(f[2]) >= 11]
+            if not frames:
+                p = parse(reply)
+                if p and p[1] == 0x0E:
+                    raise ChangerCommandError(f"{self.name} can't report its slots right now (is it busy loading?).")
+                raise ChangerCommandError(f"{self.name} didn't report its slots.")
+            for _, _, data in frames:
+                base = data[0] * 80 if data[0] <= 4 else packet * 80
+                for i, byte in enumerate(data[1:11]):
+                    for bit in range(8):
+                        if byte & (1 << bit):
+                            slots.append(base + i * 8 + bit + 1)
+            await asyncio.sleep(0.15)
+        return sorted(set(slots))
 
     # --- control --------------------------------------------------------------------------
     async def power(self, on: bool) -> None:
